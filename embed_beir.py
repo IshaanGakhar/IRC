@@ -234,7 +234,8 @@ def flush_chunk(out_dir: Path, chunk_idx: int,
     ids_p = chunk_ids_path(out_dir, chunk_idx)
     tmp_npy = out_dir / (npy_p.name + ".tmp")
     tmp_ids = out_dir / (ids_p.name + ".tmp")
-    np.save(tmp_npy, arr)
+    with tmp_npy.open("wb") as f:
+        np.save(f, arr, allow_pickle=False)
     with tmp_ids.open("w", encoding="utf-8") as f:
         for i in ids:
             f.write(i + "\n")
