@@ -25,4 +25,6 @@ beir-data/
 data/
 
 embeddings/
+embeddings_minilm/
 embed_beir_log_*.txt
+embed_beir_minilm_log_*.txt

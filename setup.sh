@@ -55,17 +55,46 @@ cat <<'EOF'
 ==============================================================
   Setup complete. Virtualenv is active.
 --------------------------------------------------------------
-  geometry.py    -> uniform scalar quantization of hyperspherical angles with Jacobian-aware bit allocation vs float32/int8 baselines
-  geo2.py        -> dynamic per-angle precision tiers (f32/f16/u8/u4/u2/clipped) assigned by greedy knapsack under a bit budget
-  geo3.py        -> geo2 tier quantization plus a stacked int8 residual stage for higher fidelity at extra storage
-  embed_beir.py  -> embed every BEIR dataset's corpus+queries with OpenAI embeddings (resumable, tqdm, writes a run log)
+  geometry.py          -> uniform scalar quantization of hyperspherical angles with Jacobian-aware bit allocation vs float32/int8 baselines
+  geo2.py              -> dynamic per-angle precision tiers (f32/f16/u8/u4/u2/clipped) assigned by greedy knapsack under a bit budget
+  geo3.py              -> geo2 tier quantization plus a stacked int8 residual stage for higher fidelity at extra storage
+  embed_beir.py        -> embed every BEIR dataset's corpus+queries with OpenAI text-embedding-3-small (resumable, tqdm, run log)
+  embed_beir_minilm.py -> OPTIONAL: same pipeline but with a local sentence-transformers model (default: all-MiniLM-L6-v2)
 
   Run any of them with:
       python geometry.py
       python geo2.py
       python geo3.py
-      python embed_beir.py --data-dir /path/to/bier-data --output-dir ./embeddings
+      python embed_beir.py        --data-dir /path/to/bier-data --output-dir ./embeddings
+      python embed_beir_minilm.py --data-dir /path/to/bier-data --output-dir ./embeddings_minilm
 
-  (make sure OPENAI_API_KEY is set in .env)
+  (make sure OPENAI_API_KEY is set in .env for embed_beir.py)
+--------------------------------------------------------------
+  Notes on embed_beir_minilm.py (local model -- runs ON THIS MACHINE):
+
+  - The model runs locally; no API. Speed is purely a function of the CPU/GPU
+    you have. It auto-detects CUDA: if present it uses GPU, else CPU.
+
+  - On a CPU-only instance (e.g. t3.medium, 2 vCPU) it will be very slow on
+    big corpora -- expect ~30-80 docs/s before t3 burst credits drain, then
+    ~10-20 docs/s sustained. Fine for small datasets (nfcorpus, scifact, fiqa)
+    but rough for fever / msmarco / hotpotqa.
+        python embed_beir_minilm.py --data-dir ~/bier-data \
+            --datasets nfcorpus scifact --batch-size 32
+
+  - On a GPU instance (g4dn.xlarge / g5.xlarge / g6.xlarge) it is dramatically
+    faster (~3000-10000 docs/s). The default torch wheel from PyPI is CPU-only;
+    on a GPU box reinstall torch with the right CUDA wheel BEFORE running:
+        pip install --index-url https://download.pytorch.org/whl/cu121 torch
+    Then:
+        python embed_beir_minilm.py --data-dir ~/bier-data --datasets fever \
+            --fp16 --batch-size 512
+
+  - Output goes to ./embeddings_minilm/ by default (separate from the OpenAI
+    embeddings in ./embeddings/). Chunk filenames carry a ".minilm-l6." tag so
+    accidentally mixing the two corpora is impossible.
+
+  - Resumable: kill it any time (Ctrl-C, instance reboot, OOM); rerunning the
+    same command picks up at the last flushed chunk.
 ==============================================================
 EOF
