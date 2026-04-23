@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import math
 import os
 import time
@@ -222,26 +223,30 @@ def cartesian_quant(vecs: np.ndarray, bits: int) -> np.ndarray:
 # -- Hyperspherical conversion --
 
 def cartesian_to_hyperspherical(x: np.ndarray) -> np.ndarray:
+    """float32 throughout -- halves peak memory vs float64 with negligible precision loss."""
+    x = x.astype(np.float32, copy=False)
     N, n = x.shape
-    angles = np.zeros((N, n - 1), dtype=np.float64)
-    sq = x.astype(np.float64) ** 2
+    angles = np.zeros((N, n - 1), dtype=np.float32)
+    sq = x ** 2
     rev_cumsum = np.cumsum(sq[:, ::-1], axis=1)[:, ::-1]
     tail = np.sqrt(np.clip(rev_cumsum, 0.0, None))
+    del sq, rev_cumsum
     for i in range(n - 2):
-        denom = np.clip(tail[:, i], 1e-12, None)
-        ratio = np.clip(x[:, i].astype(np.float64) / denom, -1.0, 1.0)
+        denom = np.clip(tail[:, i], 1e-7, None)
+        ratio = np.clip(x[:, i] / denom, -1.0, 1.0)
         angles[:, i] = np.arccos(ratio)
-    last = np.arctan2(x[:, n - 1].astype(np.float64),
-                      x[:, n - 2].astype(np.float64))
+    last = np.arctan2(x[:, n - 1], x[:, n - 2])
     angles[:, n - 2] = np.where(last < 0, last + 2 * math.pi, last)
+    del tail, last
     return angles
 
 
 def hyperspherical_to_cartesian(angles: np.ndarray) -> np.ndarray:
+    angles = angles.astype(np.float32, copy=False)
     N, m = angles.shape
     n = m + 1
-    x = np.zeros((N, n), dtype=np.float64)
-    sin_prod = np.ones(N, dtype=np.float64)
+    x = np.zeros((N, n), dtype=np.float32)
+    sin_prod = np.ones(N, dtype=np.float32)
     for i in range(m):
         x[:, i] = sin_prod * np.cos(angles[:, i])
         sin_prod = sin_prod * np.sin(angles[:, i])
@@ -259,12 +264,12 @@ def recon_from_angles(angles: np.ndarray) -> np.ndarray:
 
 def angle_uniform_quant(angles: np.ndarray, bits_per_angle: int) -> np.ndarray:
     M  = angles.shape[1]
-    hi = np.full(M, math.pi, dtype=np.float64)
+    hi = np.full(M, math.pi, dtype=np.float32)
     hi[-1] = 2 * math.pi
     levels = 1 << bits_per_angle
-    q = np.floor(np.clip(angles, 0.0, hi - 1e-12) / hi * levels).astype(np.int64)
+    q = np.floor(np.clip(angles, 0.0, hi - 1e-6) / hi * levels).astype(np.int32)
     q = np.clip(q, 0, levels - 1)
-    return (q.astype(np.float64) + 0.5) * (hi / levels)
+    return (q.astype(np.float32) + 0.5) * (hi / levels)
 
 
 # -- Jacobian-aware bit allocation (from geometry.py) --
@@ -304,18 +309,18 @@ def jacobian_bit_allocation(n_angles: int, total_bits: int,
 
 def angle_jacobian_quant(angles: np.ndarray, bits_arr: np.ndarray) -> np.ndarray:
     M  = angles.shape[1]
-    hi = np.full(M, math.pi, dtype=np.float64)
+    hi = np.full(M, math.pi, dtype=np.float32)
     hi[-1] = 2 * math.pi
-    levels = (1 << bits_arr.astype(np.int64))
-    a = np.clip(angles, 0.0, hi - 1e-12)
-    q = np.floor(a / hi * levels).astype(np.int64)
+    levels = (1 << bits_arr.astype(np.int32))
+    a = np.clip(angles, 0.0, hi - 1e-6)
+    q = np.floor(a / hi * levels).astype(np.int32)
     q = np.clip(q, 0, levels - 1)
-    deq = np.zeros_like(angles)
+    deq = np.zeros_like(angles, dtype=np.float32)
     for i in range(M):
         if bits_arr[i] == 0:
-            deq[:, i] = hi[i] / 2.0          # midpoint for 0-bit angles
+            deq[:, i] = hi[i] / 2.0
         else:
-            deq[:, i] = (q[:, i].astype(np.float64) + 0.5) * (hi[i] / levels[i])
+            deq[:, i] = (q[:, i].astype(np.float32) + 0.5) * (hi[i] / levels[i])
     return deq
 
 
@@ -324,10 +329,12 @@ def angle_jacobian_quant(angles: np.ndarray, bits_arr: np.ndarray) -> np.ndarray
 TIER_BITS_ARR = [0, 2, 4, 8, 16, 32]   # indexed by tier id 0..5
 
 def estimate_sensitivity(angles_calib: np.ndarray) -> np.ndarray:
-    log_sin2 = 2.0 * np.log(np.clip(np.sin(angles_calib), 1e-12, None))
+    a = angles_calib.astype(np.float32, copy=False)
+    log_sin2 = 2.0 * np.log(np.clip(np.sin(a), 1e-7, None))
     cum = np.zeros_like(log_sin2)
     cum[:, 1:] = np.cumsum(log_sin2[:, :-1], axis=1)
     mean_log = cum.mean(axis=0)
+    del cum, log_sin2
     sens = np.exp(mean_log - mean_log.max())
     return sens
 
@@ -387,24 +394,24 @@ def apply_tiers(angles: np.ndarray, tiers: np.ndarray,
                 clip_means: np.ndarray) -> np.ndarray:
     """Quantize then dequantize using per-angle tier assignment."""
     N, M = angles.shape
-    out = np.empty((N, M), dtype=np.float64)
-    out[:] = clip_means[None, :]
+    out = np.empty((N, M), dtype=np.float32)
+    out[:] = clip_means[None, :].astype(np.float32)
     for tier_id, bits in enumerate(TIER_BITS_ARR):
         idx = np.where(tiers == tier_id)[0]
         if not len(idx):
             continue
         if bits == 0:
             continue  # already filled with clip_means
-        r_vec = angle_ranges[idx]
+        r_vec = angle_ranges[idx].astype(np.float32)
         if bits <= 8:
             levels = 1 << bits
-            a = np.clip(angles[:, idx], 0.0, r_vec - 1e-12)
+            a = np.clip(angles[:, idx], 0.0, r_vec - 1e-6)
             q = np.clip(np.floor(a / r_vec * levels).astype(np.int32), 0, levels - 1)
-            out[:, idx] = (q.astype(np.float64) + 0.5) * (r_vec / levels)
+            out[:, idx] = (q.astype(np.float32) + 0.5) * (r_vec / levels)
         elif bits == 16:
-            out[:, idx] = angles[:, idx].astype(np.float16).astype(np.float64)
+            out[:, idx] = angles[:, idx].astype(np.float16).astype(np.float32)
         else:
-            out[:, idx] = angles[:, idx].astype(np.float32).astype(np.float64)
+            out[:, idx] = angles[:, idx].astype(np.float32)
     return out
 
 
@@ -463,6 +470,7 @@ def run_all(
     t0 = time.perf_counter()
     c_angles = cartesian_to_hyperspherical(c_vecs)
     q_angles = cartesian_to_hyperspherical(q_vecs)
+    gc.collect()
     print(f"  done in {time.perf_counter()-t0:.1f}s")
 
     rt_err = float(np.mean(np.linalg.norm(
@@ -471,9 +479,10 @@ def run_all(
 
     emp_std      = c_angles.std(axis=0)
     angle_means  = c_angles.mean(axis=0)
-    angle_ranges = np.full(n_angles, math.pi, dtype=np.float64)
+    angle_ranges = np.full(n_angles, math.pi, dtype=np.float32)
     angle_ranges[-1] = 2 * math.pi
     sens = estimate_sensitivity(c_angles)
+    gc.collect()
 
     # ---- 4. CLIPPING VALIDATION: 0-bit (all angles at corpus mean) ----
     print("\n--- Clipping validation ---")
@@ -643,8 +652,8 @@ def main():
     ap.add_argument("--embed-tag", default="",
                     help="Chunk filename tag (e.g. 'minilm-l6-vllm'). "
                          "Empty string means the plain OAI layout (no tag).")
-    ap.add_argument("--max-corpus",  type=int, default=200_000,
-                    help="Max corpus docs to load (default 200k to fit in RAM). "
+    ap.add_argument("--max-corpus",  type=int, default=50_000,
+                    help="Max corpus docs to load (default 50k, safe for t3.medium 4GB). "
                          "Use 0 for no limit (requires ~33 GB for full FEVER).")
     ap.add_argument("--max-queries", type=int, default=0,
                     help="Max queries to evaluate (0 = all).")
