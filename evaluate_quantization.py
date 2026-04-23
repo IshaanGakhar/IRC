@@ -313,14 +313,15 @@ def angle_jacobian_quant(angles: np.ndarray, bits_arr: np.ndarray) -> np.ndarray
     hi[-1] = 2 * math.pi
     levels = (1 << bits_arr.astype(np.int32))
     a = np.clip(angles, 0.0, hi - 1e-6)
-    q = np.floor(a / hi * levels).astype(np.int32)
-    q = np.clip(q, 0, levels - 1)
+    q = np.clip(np.floor(a / hi * levels).astype(np.int32), 0, levels - 1)
+    del a
     deq = np.zeros_like(angles, dtype=np.float32)
     for i in range(M):
         if bits_arr[i] == 0:
             deq[:, i] = hi[i] / 2.0
         else:
             deq[:, i] = (q[:, i].astype(np.float32) + 0.5) * (hi[i] / levels[i])
+    del q
     return deq
 
 
@@ -464,6 +465,7 @@ def run_all(
         cv = cartesian_quant(c_vecs, bits)
         qv = cartesian_quant(q_vecs, bits)
         ev(label, bits * dim, cv, qv, family="cartesian")
+        del cv, qv;  gc.collect()
 
     # ---- 3. Convert to angles (shared for all angle schemes) ----
     print("\nConverting corpus to hyperspherical angles (may take a few minutes) ...")
@@ -489,27 +491,27 @@ def run_all(
     clip_cv = recon_from_angles(np.broadcast_to(angle_means, c_angles.shape).copy())
     clip_qv = recon_from_angles(np.broadcast_to(angle_means, q_angles.shape).copy())
     ev("CLIPPED (0-bit, all @ mean)", 0, clip_cv, clip_qv, family="clipping")
+    del clip_cv, clip_qv;  gc.collect()
 
-    # partial clipping: only clip the last 50% of angles (least sensitive)
     half_angles_c = c_angles.copy()
     half_angles_c[:, n_angles // 2:] = angle_means[n_angles // 2:]
     half_angles_q = q_angles.copy()
     half_angles_q[:, n_angles // 2:] = angle_means[n_angles // 2:]
-    ev("CLIPPED last 50% angles", 0, recon_from_angles(half_angles_c),
-       recon_from_angles(half_angles_q), family="clipping")
+    hcv = recon_from_angles(half_angles_c);  del half_angles_c
+    hqv = recon_from_angles(half_angles_q);  del half_angles_q
+    ev("CLIPPED last 50% angles", 0, hcv, hqv, family="clipping")
+    del hcv, hqv;  gc.collect()
 
     # ---- 5. Angle-uniform sweep ----
     print("\n--- Angle uniform quantization ---")
     for budget in BIT_BUDGETS:
-        avg_bits = budget // n_angles
-        if avg_bits < 1:
-            avg_bits = 1
+        avg_bits = max(1, budget // n_angles)
         deq_c = angle_uniform_quant(c_angles, avg_bits)
         deq_q = angle_uniform_quant(q_angles, avg_bits)
-        cv = recon_from_angles(deq_c)
-        qv = recon_from_angles(deq_q)
-        ev(f"angle-uniform {avg_bits}b/angle ({budget}b total)",
-           budget, cv, qv, family="angle-uniform")
+        cv = recon_from_angles(deq_c);  del deq_c
+        qv = recon_from_angles(deq_q);  del deq_q
+        ev(f"angle-uniform {avg_bits}b/angle ({budget}b total)", budget, cv, qv, family="angle-uniform")
+        del cv, qv;  gc.collect()
 
     # ---- 6. Jacobian-aware sweep (propagation prior) ----
     print("\n--- Angle Jacobian-prior quantization ---")
@@ -517,10 +519,11 @@ def run_all(
         bits_arr = jacobian_bit_allocation(n_angles, budget)
         deq_c = angle_jacobian_quant(c_angles, bits_arr)
         deq_q = angle_jacobian_quant(q_angles, bits_arr)
-        cv = recon_from_angles(deq_c)
-        qv = recon_from_angles(deq_q)
+        cv = recon_from_angles(deq_c);  del deq_c
+        qv = recon_from_angles(deq_q);  del deq_q
         ev(f"angle-jacobian {budget}b (min={bits_arr.min()} med={int(np.median(bits_arr))} max={bits_arr.max()})",
            int(bits_arr.sum()), cv, qv, family="angle-jacobian")
+        del cv, qv;  gc.collect()
 
     # ---- 7. Empirical-std bit allocation ----
     print("\n--- Angle empirical-std quantization ---")
@@ -528,27 +531,29 @@ def run_all(
         bits_arr = jacobian_bit_allocation(n_angles, budget, empirical_std=emp_std)
         deq_c = angle_jacobian_quant(c_angles, bits_arr)
         deq_q = angle_jacobian_quant(q_angles, bits_arr)
-        cv = recon_from_angles(deq_c)
-        qv = recon_from_angles(deq_q)
+        cv = recon_from_angles(deq_c);  del deq_c
+        qv = recon_from_angles(deq_q);  del deq_q
         ev(f"angle-emp-std {budget}b", int(bits_arr.sum()), cv, qv, family="angle-emp-std")
+        del cv, qv;  gc.collect()
 
     # ---- 8. Dynamic tier ----
     print("\n--- Dynamic tier quantization ---")
     for budget in BIT_BUDGETS:
-        tiers_arr = assign_tiers(sens, budget, angle_ranges)
+        tiers_arr   = assign_tiers(sens, budget, angle_ranges)
         actual_bits = int(sum(TIER_BITS_ARR[t] for t in tiers_arr))
         deq_c = apply_tiers(c_angles, tiers_arr, angle_ranges, angle_means)
         deq_q = apply_tiers(q_angles, tiers_arr, angle_ranges, angle_means)
-        cv = recon_from_angles(deq_c)
-        qv = recon_from_angles(deq_q)
-        ev(f"dyn-tier {budget}b (actual={actual_bits}b)",
-           actual_bits, cv, qv, family="dyn-tier")
+        cv = recon_from_angles(deq_c);  del deq_c
+        qv = recon_from_angles(deq_q);  del deq_q
+        ev(f"dyn-tier {budget}b (actual={actual_bits}b)", actual_bits, cv, qv, family="dyn-tier")
 
         # ---- 9. Residual int8 on top of dynamic tier ----
         cv_stack = residual_int8_stack(c_vecs, cv)
         qv_stack = residual_int8_stack(q_vecs, qv)
+        del cv, qv;  gc.collect()
         ev(f"dyn-tier {budget}b + residual-int8",
            actual_bits + 8 * dim, cv_stack, qv_stack, family="dyn-tier+residual")
+        del cv_stack, qv_stack;  gc.collect()
 
     return results
 
