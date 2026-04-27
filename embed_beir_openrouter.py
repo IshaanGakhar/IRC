@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+import requests as _requests
 from dotenv import load_dotenv
 from openai import OpenAI           # OpenRouter is OpenAI-compatible
 from tqdm import tqdm
@@ -224,56 +225,55 @@ def make_client(api_key: str) -> OpenAI:
     )
 
 
+def embed_batch_raw(api_key: str, model: str, texts: list[str],
+                    logger: logging.Logger) -> np.ndarray:
+    """Bypass the OpenAI client and call OpenRouter directly with requests.
+    Lets us see the actual HTTP status + body when the client returns null."""
+    url = f"{OPENROUTER_BASE}/embeddings"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/IRC-research",
+        "X-Title": "BEIR-IRC-embedding",
+    }
+    payload = {"model": model, "input": texts, "encoding_format": "float"}
+    resp = _requests.post(url, json=payload, headers=headers, timeout=120)
+    if resp.status_code != 200:
+        raise ValueError(f"HTTP {resp.status_code}: {resp.text[:500]}")
+    body = resp.json()
+    if "data" not in body or not body["data"]:
+        raise ValueError(f"empty data in response: {str(body)[:500]}")
+    vecs = np.array([d["embedding"] for d in body["data"]], dtype=np.float32)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    return vecs / np.clip(norms, 1e-12, None)
+
+
 def embed_batch(client: OpenAI, model: str, texts: list[str],
-                logger: logging.Logger) -> np.ndarray:
+                logger: logging.Logger, api_key: str = "") -> np.ndarray:
     delay    = INITIAL_BACKOFF
     last_err = None
 
     # If batch has multiple texts and keeps failing, try splitting it in half
     # down to individual items before giving up.
-    if len(texts) > 1:
-        for attempt in range(4):
-            try:
-                resp = client.embeddings.create(model=model, input=texts,
-                                                encoding_format="float")
-                if resp.data is None or len(resp.data) == 0:
-                    logger.warning(f"null data response (batch={len(texts)}): "
-                                   f"{vars(resp) if hasattr(resp, '__dict__') else resp}")
-                    raise ValueError("empty/null data")
-                vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
-                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-                return vecs / np.clip(norms, 1e-12, None)
-            except Exception as e:
-                last_err = e
-                logger.warning(f"batch embed error (attempt {attempt+1}/4, "
-                               f"batch={len(texts)}): {type(e).__name__}: {e}. "
-                               f"sleep {delay:.1f}s")
-                time.sleep(delay)
-                delay = min(delay * 2, 30.0)
-
-        # Full batch failed -- fall back to one-by-one
-        logger.warning(f"batch of {len(texts)} failed 4x -- falling back to one-by-one")
-        vecs_list = [embed_batch(client, model, [t], logger) for t in texts]
-        return np.concatenate(vecs_list, axis=0)
-
-    # Single-item path -- retry up to MAX_RETRIES
     for attempt in range(MAX_RETRIES):
         try:
-            resp = client.embeddings.create(model=model, input=texts,
-                                            encoding_format="float")
-            if resp.data is None or len(resp.data) == 0:
-                logger.warning(f"null data response (single): "
-                               f"{vars(resp) if hasattr(resp, '__dict__') else resp}")
-                raise ValueError("empty/null data")
-            vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
-            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-            return vecs / np.clip(norms, 1e-12, None)
+            return embed_batch_raw(api_key, model, texts, logger)
         except Exception as e:
             last_err = e
-            logger.warning(f"single embed error (attempt {attempt+1}/{MAX_RETRIES}): "
-                           f"{type(e).__name__}: {e}. sleep {delay:.1f}s")
+            logger.warning(f"embed error (attempt {attempt+1}/{MAX_RETRIES}, "
+                           f"batch={len(texts)}): {type(e).__name__}: {e}. "
+                           f"sleep {delay:.1f}s")
             time.sleep(delay)
             delay = min(delay * 2, MAX_BACKOFF)
+
+    # Last resort: split batch in half recursively down to single items
+    if len(texts) > 1:
+        logger.warning(f"batch of {len(texts)} exhausted retries -- splitting in half")
+        mid = len(texts) // 2
+        left  = embed_batch(client, model, texts[:mid],  logger, api_key)
+        right = embed_batch(client, model, texts[mid:], logger, api_key)
+        return np.concatenate([left, right], axis=0)
+
     raise RuntimeError(f"embed failed after {MAX_RETRIES} retries: {last_err}")
 
 
@@ -289,6 +289,7 @@ def embed_split(
     chunk_batches: int,
     logger: logging.Logger,
     n_workers: int = DEFAULT_WORKERS,
+    api_key: str = "",
 ) -> dict:
     """
     Concurrent embedding: a producer feeds batches into a queue;
@@ -327,7 +328,7 @@ def embed_split(
                 break
             seq, ids, texts = item
             try:
-                vecs = embed_batch(client, model, texts, logger)
+                vecs = embed_batch(client, model, texts, logger, api_key)
                 result_q.put((seq, ids, vecs))
             except Exception as e:
                 error_box.append(e)
@@ -550,7 +551,7 @@ def main():
                             lambda: iter_corpus(corpus_file),
                             n, ds_out / "corpus",
                             args.batch_size, args.chunk_batches, logger,
-                            n_workers=args.workers)
+                            n_workers=args.workers, api_key=api_key)
             s["dataset"] = ds_name
             all_stats.append(s)
 
@@ -561,7 +562,7 @@ def main():
                             lambda: iter_queries(queries_file),
                             n, ds_out / "queries",
                             args.batch_size, args.chunk_batches, logger,
-                            n_workers=args.workers)
+                            n_workers=args.workers, api_key=api_key)
             s["dataset"] = ds_name
             all_stats.append(s)
 
