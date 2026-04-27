@@ -25,6 +25,7 @@ beir-data/
 data/
 
 eval_results/
+eval_results_full/
 *.png
 embeddings_minilm/
 embeddings_vllm/
