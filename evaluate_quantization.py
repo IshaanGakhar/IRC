@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import gc
 import math
 import os
@@ -389,11 +390,25 @@ def residual_int8_pv(original: np.ndarray, stage1: np.ndarray) -> np.ndarray:
 
 # Bit budgets for greedy tier sweep (float32 = 32*dim bits)
 TIER_BUDGETS  = [1536, 3072, 4608, 6144, 9216, 12288]
-CLIP_FRACS    = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-TRUNC_FRACS   = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+# Default clip fractions: coarse sweep safe for 4 GB RAM.
+# Use --fine-sweep for the full 0-100% in 10% steps.
+CLIP_FRACS_COARSE = [0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]
+CLIP_FRACS_FINE   = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+TRUNC_FRACS       = [0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0]
 
 # Fixed budget for ablation table (~8x compression for 1536-dim OAI embeddings)
 ABLATION_BITS = 6144
+
+
+def free_mem() -> None:
+    """gc.collect() + tell the C allocator to return freed pages to the OS.
+    Prevents memory fragmentation from accumulating across many experiments."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass   # non-Linux or static libc -- gc.collect() is still fine
 
 
 def run_all(
@@ -401,6 +416,7 @@ def run_all(
     c_ids: list[str], q_ids: list[str],
     qrels: dict[str, dict[str, int]],
     batch_q: int,
+    fine_sweep: bool = False,
 ) -> tuple[list[EvalResult], list[EvalResult], list[EvalResult],
            list[EvalResult], list[EvalResult]]:
     """
@@ -410,6 +426,8 @@ def run_all(
     n_angles = dim - 1
     hi       = np.full(n_angles, math.pi, dtype=np.float32)
     hi[-1]   = 2 * math.pi
+
+    clip_fracs = CLIP_FRACS_FINE if fine_sweep else CLIP_FRACS_COARSE
 
     results:      list[EvalResult] = []
     clip_pos:     list[EvalResult] = []
@@ -435,7 +453,7 @@ def run_all(
         cv = quant_cartesian(c_vecs, bits)
         qv = quant_cartesian(q_vecs, bits)
         ev(f"Cartesian int{bits}", "cartesian", bits * dim, cv, qv)
-        del cv, qv; gc.collect()
+        del cv, qv; free_mem()
 
     # -------------------------------------------------------------------
     # Convert to angles + Jacobian ranking (shared for all remaining groups)
@@ -447,7 +465,7 @@ def run_all(
     sens       = jacobian_sensitivity(c_angles)
     jac_rank   = rank_by_sensitivity(sens)
     angle_ranges = hi.copy()
-    gc.collect()
+    free_mem()
 
     print(f"  sensitivity: max={sens[jac_rank[0]]:.4f}  "
           f"min={sens[jac_rank[-1]]:.2e}  "
@@ -459,39 +477,39 @@ def run_all(
     print("\n=== B. Angle uniform quantization ===")
     for bits in (8, 4, 2):
         deq_c = quant_angles_uniform(c_angles, bits, hi)
+        cv = from_angles(deq_c); del deq_c; free_mem()
         deq_q = quant_angles_uniform(q_angles, bits, hi)
-        cv = from_angles(deq_c); del deq_c
         qv = from_angles(deq_q); del deq_q
         ev(f"Angle int{bits} uniform", "angle-uniform", bits * n_angles, cv, qv)
-        del cv, qv; gc.collect()
+        del cv, qv; free_mem()
 
     # -------------------------------------------------------------------
     # C. Clipping sweep: positional vs Jacobian
     # -------------------------------------------------------------------
-    print("\n=== C. Clipping sweep (positional vs Jacobian) ===")
-    for frac in CLIP_FRACS:
+    print(f"\n=== C. Clipping sweep ({'fine' if fine_sweep else 'coarse'}) ===")
+    for frac in clip_fracs:
         keep_n = int(round(n_angles * (1.0 - frac)))
         bits   = keep_n * 8
 
-        # Positional (naive)
+        # Positional (naive) -- corpus and query done sequentially to halve peak memory
         deq_c = quant_angles_clip(c_angles, hi, 8, keep_n, clip_means)
+        cv = from_angles(deq_c); del deq_c; free_mem()
         deq_q = quant_angles_clip(q_angles, hi, 8, keep_n, clip_means)
-        cv = from_angles(deq_c); del deq_c
         qv = from_angles(deq_q); del deq_q
         label = f"Pos-clip {int(frac*100):3d}% (keep {keep_n}@int8={bits}b)"
         r = ev(label, "clip-positional", bits, cv, qv)
         clip_pos.append(r)
-        del cv, qv; gc.collect()
+        del cv, qv; free_mem()
 
         # Jacobian-ranked
         deq_c = quant_angles_clip(c_angles, hi, 8, keep_n, clip_means, jac_rank)
+        cv = from_angles(deq_c); del deq_c; free_mem()
         deq_q = quant_angles_clip(q_angles, hi, 8, keep_n, clip_means, jac_rank)
-        cv = from_angles(deq_c); del deq_c
         qv = from_angles(deq_q); del deq_q
         label = f"Jac-clip {int(frac*100):3d}% (keep {keep_n}@int8={bits}b)"
         r = ev(label, "clip-jacobian", bits, cv, qv)
         clip_jac.append(r)
-        del cv, qv; gc.collect()
+        del cv, qv; free_mem()
 
     # -------------------------------------------------------------------
     # D. Greedy tier sweep (Jacobian-informed, mixed precision)
@@ -507,9 +525,10 @@ def run_all(
               f"i8={tier_counts[8]} f16={tier_counts[16]} f32={tier_counts[32]}")
 
         deq_c = apply_greedy_tiers(c_angles, tiers, hi, clip_means)
+        cv = from_angles(deq_c); del deq_c; free_mem()
         deq_q = apply_greedy_tiers(q_angles, tiers, hi, clip_means)
-        cv = from_angles(deq_c); del deq_c
         qv = from_angles(deq_q); del deq_q
+
         label = f"Greedy-tier budget={budget}b (actual={actual}b)"
         r = ev(label, "greedy-tier", actual, cv, qv)
         greedy_sweep.append(r)
@@ -517,10 +536,10 @@ def run_all(
         # Greedy + residual int8
         cv_res = residual_int8_pv(c_vecs, cv)
         qv_res = residual_int8_pv(q_vecs, qv)
-        del cv, qv; gc.collect()
+        del cv, qv; free_mem()
         label_res = f"Greedy-tier {budget}b + residual-int8"
         r_res = ev(label_res, "greedy+residual", actual + 8 * dim, cv_res, qv_res)
-        del cv_res, qv_res; gc.collect()
+        del cv_res, qv_res; free_mem()
 
     # -------------------------------------------------------------------
     # E. Truncation tradeoff: int8/int4/int2 (Jacobian-ranked)
@@ -533,13 +552,13 @@ def run_all(
             bits   = keep_n * keep_bits
             deq_c  = quant_angles_clip(c_angles, hi, keep_bits, keep_n,
                                        clip_means, jac_rank)
+            cv = from_angles(deq_c); del deq_c; free_mem()
             deq_q  = quant_angles_clip(q_angles, hi, keep_bits, keep_n,
                                        clip_means, jac_rank)
-            cv = from_angles(deq_c); del deq_c
             qv = from_angles(deq_q); del deq_q
             label = f"Jac-trunc int{keep_bits} keep={int(kf*100)}%"
             ev(label, f"jac-trunc-int{keep_bits}", bits, cv, qv)
-            del cv, qv; gc.collect()
+            del cv, qv; free_mem()
 
     # -------------------------------------------------------------------
     # F. Ablation table (fixed budget = ABLATION_BITS)
@@ -549,49 +568,47 @@ def run_all(
     keep_n_ab = ABLATION_BITS // 8                        # for int8 clipping
     keep_n_i4 = ABLATION_BITS // 4                        # for int4 clipping
 
-    # F1: Cartesian int8 at same budget (need to pick equivalent bits/dim)
-    # ABLATION_BITS bits on Cartesian: bits_per_dim = ABLATION_BITS // dim
+    # F1: Cartesian int at ablation budget
     cart_bits = max(1, ABLATION_BITS // dim)
     cv = quant_cartesian(c_vecs, cart_bits)
     qv = quant_cartesian(q_vecs, cart_bits)
-    r  = ev(f"[Ablation] Cartesian int{cart_bits} (~{ABLATION_BITS}b)",
-            "ablation", cart_bits * dim, cv, qv, store=ablation)
-    del cv, qv; gc.collect()
+    ev(f"[Ablation] Cartesian int{cart_bits} (~{ABLATION_BITS}b)",
+       "ablation", cart_bits * dim, cv, qv, store=ablation)
+    del cv, qv; free_mem()
 
-    # F2: Angle int8 uniform (no ranking, no clipping)
+    # F2: Angle int8 uniform
     deq_c = quant_angles_uniform(c_angles, 8, hi)
+    cv = from_angles(deq_c); del deq_c; free_mem()
     deq_q = quant_angles_uniform(q_angles, 8, hi)
-    cv = from_angles(deq_c); del deq_c
     qv = from_angles(deq_q); del deq_q
     ev(f"[Ablation] + Angles int8 uniform ({n_angles*8}b)",
        "ablation", n_angles * 8, cv, qv, store=ablation)
-    # keep cv/qv for residual below
-    del cv, qv; gc.collect()
+    del cv, qv; free_mem()
 
-    # F3: Angles + positional clip (no Jacobian ranking)
+    # F3: Positional clip
     deq_c = quant_angles_clip(c_angles, hi, 8, keep_n_ab, clip_means)
+    cv = from_angles(deq_c); del deq_c; free_mem()
     deq_q = quant_angles_clip(q_angles, hi, 8, keep_n_ab, clip_means)
-    cv = from_angles(deq_c); del deq_c
     qv = from_angles(deq_q); del deq_q
     ev(f"[Ablation] + Positional clip to {ABLATION_BITS}b",
        "ablation", keep_n_ab * 8, cv, qv, store=ablation)
-    del cv, qv; gc.collect()
+    del cv, qv; free_mem()
 
-    # F4: Angles + Jacobian clip (ranking added)
+    # F4: Jacobian clip
     deq_c = quant_angles_clip(c_angles, hi, 8, keep_n_ab, clip_means, jac_rank)
+    cv = from_angles(deq_c); del deq_c; free_mem()
     deq_q = quant_angles_clip(q_angles, hi, 8, keep_n_ab, clip_means, jac_rank)
-    cv = from_angles(deq_c); del deq_c
     qv = from_angles(deq_q); del deq_q
     ev(f"[Ablation] + Jacobian clip to {ABLATION_BITS}b",
        "ablation", keep_n_ab * 8, cv, qv, store=ablation)
-    del cv, qv; gc.collect()
+    del cv, qv; free_mem()
 
-    # F5: Greedy tier at ABLATION_BITS budget
+    # F5: Greedy tier
     tiers  = greedy_tier_assign(sens, ABLATION_BITS, angle_ranges)
     actual = tier_bits_used(tiers)
     deq_c  = apply_greedy_tiers(c_angles, tiers, hi, clip_means)
+    cv = from_angles(deq_c); del deq_c; free_mem()
     deq_q  = apply_greedy_tiers(q_angles, tiers, hi, clip_means)
-    cv = from_angles(deq_c); del deq_c
     qv = from_angles(deq_q); del deq_q
     ev(f"[Ablation] + Greedy tier ~{ABLATION_BITS}b (actual={actual}b)",
        "ablation", actual, cv, qv, store=ablation)
@@ -599,12 +616,12 @@ def run_all(
     # F6: Greedy + residual int8
     cv_res = residual_int8_pv(c_vecs, cv)
     qv_res = residual_int8_pv(q_vecs, qv)
-    del cv, qv; gc.collect()
+    del cv, qv; free_mem()
     ev(f"[Ablation] + Residual int8 ({actual + 8*dim}b total)",
        "ablation", actual + 8 * dim, cv_res, qv_res, store=ablation)
-    del cv_res, qv_res; gc.collect()
+    del cv_res, qv_res; free_mem()
 
-    del c_angles, q_angles; gc.collect()
+    del c_angles, q_angles; free_mem()
     return results, clip_pos, clip_jac, greedy_sweep, ablation
 
 
@@ -868,6 +885,9 @@ def main():
     ap.add_argument("--max-queries", type=int, default=0)
     ap.add_argument("--output-dir",  default="eval_results")
     ap.add_argument("--batch-q",     type=int, default=256)
+    ap.add_argument("--fine-sweep",  action="store_true",
+                    help="Use 11-point clipping sweep (0-100%% in 10%% steps). "
+                         "Needs more RAM. Default: 7-point coarse sweep.")
     ap.add_argument("--full-corpus-n", type=int, default=5_416_568,
                     help="Full corpus size for MB-saved calculation in tradeoff table.")
     args = ap.parse_args()
@@ -910,7 +930,8 @@ def main():
           f"float32={base_bits:,}b/vec\n")
 
     results, clip_pos, clip_jac, greedy_sweep, ablation = run_all(
-        c_vecs, q_vecs_f, c_ids, filt_qids, qrels_f, args.batch_q)
+        c_vecs, q_vecs_f, c_ids, filt_qids, qrels_f, args.batch_q,
+        fine_sweep=args.fine_sweep)
 
     base_ndcg = next(r.ndcg10 for r in results if "float32" in r.label)
 
