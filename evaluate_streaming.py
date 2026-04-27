@@ -467,11 +467,12 @@ def score_scheme(
         free_mem()
 
         chunks_done = ci + 1
-        # Atomic save: write then rename
-        tmp_ts = ts_path.with_suffix(".npy.tmp")
-        tmp_tg = tg_path.with_suffix(".npy.tmp")
-        np.save(tmp_ts, top_scores)
-        np.save(tmp_tg, top_gidx)
+        # Atomic save: write then rename (open file handle avoids np.save
+        # appending an extra .npy to paths that already end in .npy.tmp)
+        tmp_ts = ts_path.parent / (ts_path.name + ".tmp")
+        tmp_tg = tg_path.parent / (tg_path.name + ".tmp")
+        with tmp_ts.open("wb") as f: np.save(f, top_scores)
+        with tmp_tg.open("wb") as f: np.save(f, top_gidx)
         os.replace(tmp_ts, ts_path)
         os.replace(tmp_tg, tg_path)
         state_path.write_text(json.dumps(
