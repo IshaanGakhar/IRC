@@ -229,7 +229,11 @@ def embed_batch(client: OpenAI, model: str, texts: list[str],
         try:
             resp = client.embeddings.create(model=model, input=texts,
                                             encoding_format="float")
+            if resp.data is None or len(resp.data) == 0:
+                raise ValueError(f"API returned empty/null data (model={model})")
             vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
+            if vecs.shape[0] != len(texts):
+                raise ValueError(f"expected {len(texts)} embeddings, got {vecs.shape[0]}")
             norms = np.linalg.norm(vecs, axis=1, keepdims=True)
             return vecs / np.clip(norms, 1e-12, None)
         except Exception as e:
@@ -237,13 +241,12 @@ def embed_batch(client: OpenAI, model: str, texts: list[str],
             msg = str(e)
             transient = any(k in msg for k in
                             ("429", "503", "502", "rate", "timeout",
-                             "Timeout", "Connection", "overloaded"))
+                             "Timeout", "Connection", "overloaded",
+                             "null data", "empty/null"))
             logger.warning(f"API error (attempt {attempt+1}/{MAX_RETRIES}) "
                            f"{type(e).__name__}: {e}. sleep {delay:.1f}s")
             time.sleep(delay)
             delay = min(delay * 2, MAX_BACKOFF)
-            if not transient and attempt >= 2:
-                break
     raise RuntimeError(f"embed failed after {MAX_RETRIES} retries: {last_err}")
 
 
