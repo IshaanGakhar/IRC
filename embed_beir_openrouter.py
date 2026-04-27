@@ -114,11 +114,13 @@ class Item:
 
 
 def _compose_corpus_text(rec: dict) -> str:
-    title = rec.get("title") or ""
-    text  = rec.get("text")  or ""
+    title = (rec.get("title") or "").strip()
+    text  = (rec.get("text")  or "").strip()
     if title and text:
-        return f"{title}\n{text}"
-    return title or text
+        combined = f"{title}\n{text}"
+    else:
+        combined = title or text
+    return combined if combined else "[empty]"
 
 
 def iter_corpus(path: Path) -> Iterator[Item]:
@@ -136,7 +138,8 @@ def iter_queries(path: Path) -> Iterator[Item]:
             if not line.strip():
                 continue
             rec = json.loads(line)
-            yield Item(str(rec["_id"]), rec.get("text") or "")
+            text = (rec.get("text") or "").strip()
+            yield Item(str(rec["_id"]), text if text else "[empty]")
 
 
 def count_lines(path: Path) -> int:
@@ -225,25 +228,49 @@ def embed_batch(client: OpenAI, model: str, texts: list[str],
                 logger: logging.Logger) -> np.ndarray:
     delay    = INITIAL_BACKOFF
     last_err = None
+
+    # If batch has multiple texts and keeps failing, try splitting it in half
+    # down to individual items before giving up.
+    if len(texts) > 1:
+        for attempt in range(4):
+            try:
+                resp = client.embeddings.create(model=model, input=texts,
+                                                encoding_format="float")
+                if resp.data is None or len(resp.data) == 0:
+                    logger.warning(f"null data response (batch={len(texts)}): "
+                                   f"{vars(resp) if hasattr(resp, '__dict__') else resp}")
+                    raise ValueError("empty/null data")
+                vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
+                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+                return vecs / np.clip(norms, 1e-12, None)
+            except Exception as e:
+                last_err = e
+                logger.warning(f"batch embed error (attempt {attempt+1}/4, "
+                               f"batch={len(texts)}): {type(e).__name__}: {e}. "
+                               f"sleep {delay:.1f}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+
+        # Full batch failed -- fall back to one-by-one
+        logger.warning(f"batch of {len(texts)} failed 4x -- falling back to one-by-one")
+        vecs_list = [embed_batch(client, model, [t], logger) for t in texts]
+        return np.concatenate(vecs_list, axis=0)
+
+    # Single-item path -- retry up to MAX_RETRIES
     for attempt in range(MAX_RETRIES):
         try:
             resp = client.embeddings.create(model=model, input=texts,
                                             encoding_format="float")
             if resp.data is None or len(resp.data) == 0:
-                raise ValueError(f"API returned empty/null data (model={model})")
+                logger.warning(f"null data response (single): "
+                               f"{vars(resp) if hasattr(resp, '__dict__') else resp}")
+                raise ValueError("empty/null data")
             vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
-            if vecs.shape[0] != len(texts):
-                raise ValueError(f"expected {len(texts)} embeddings, got {vecs.shape[0]}")
             norms = np.linalg.norm(vecs, axis=1, keepdims=True)
             return vecs / np.clip(norms, 1e-12, None)
         except Exception as e:
             last_err = e
-            msg = str(e)
-            transient = any(k in msg for k in
-                            ("429", "503", "502", "rate", "timeout",
-                             "Timeout", "Connection", "overloaded",
-                             "null data", "empty/null"))
-            logger.warning(f"API error (attempt {attempt+1}/{MAX_RETRIES}) "
+            logger.warning(f"single embed error (attempt {attempt+1}/{MAX_RETRIES}): "
                            f"{type(e).__name__}: {e}. sleep {delay:.1f}s")
             time.sleep(delay)
             delay = min(delay * 2, MAX_BACKOFF)
@@ -355,7 +382,7 @@ def embed_split(
             if seen <= already:
                 continue
             batch_ids.append(item.ident)
-            batch_texts.append(item.text if item.text else " ")
+            batch_texts.append(item.text)   # always non-empty; guaranteed by iter_*
             if len(batch_texts) >= batch_size:
                 work_q.put((total_sent, batch_ids, batch_texts))
                 total_sent += 1
