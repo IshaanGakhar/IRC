@@ -489,7 +489,9 @@ def score_scheme(
     done_marker.write_text("ok\n")
 
     # Evaluate NDCG@10 and Recall@100 from top_gidx
-    doc_id_arr = np.array(all_doc_ids)
+    # dtype=object stores Python string pointers (~43 MB) vs dtype=str which
+    # pads every string to max length and can exceed 4 GB on FEVER.
+    doc_id_arr = np.array(all_doc_ids, dtype=object)
     ndcg_sc: list[float] = []
     rec_sc:  list[float] = []
 
