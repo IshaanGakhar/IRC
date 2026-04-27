@@ -41,7 +41,9 @@ import argparse
 import json
 import logging
 import os
+import queue
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +60,7 @@ OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 # Conservative batch size -- OpenRouter may have payload size limits
 DEFAULT_BATCH   = 32
+DEFAULT_WORKERS = 8       # concurrent API calls in flight
 CHUNK_BATCHES   = 40
 MAX_RETRIES     = 8
 INITIAL_BACKOFF = 2.0
@@ -255,7 +258,13 @@ def embed_split(
     batch_size: int,
     chunk_batches: int,
     logger: logging.Logger,
+    n_workers: int = DEFAULT_WORKERS,
 ) -> dict:
+    """
+    Concurrent embedding: a producer feeds batches into a queue;
+    n_workers threads each call the API in parallel; a consumer thread
+    collects results in order and flushes chunks.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     done_marker = out_dir / "DONE"
     stats = {"split": split_name, "total": total_items,
@@ -272,38 +281,70 @@ def embed_split(
         logger.info(f"  {split_name}: resuming after {already} items "
                     f"in {n_chunks_done} chunks")
 
-    chunk_idx       = n_chunks_done
-    chunk_size      = batch_size * chunk_batches
-    buf_vecs: list[np.ndarray] = []
-    buf_ids:  list[str]        = []
-    batch_texts: list[str] = []
-    batch_ids:   list[str] = []
+    chunk_size = batch_size * chunk_batches
+
+    # Each work item is (seq_no, ids, texts).
+    # Results queue holds (seq_no, ids, vecs) so we can reorder.
+    work_q:   queue.Queue = queue.Queue(maxsize=n_workers * 4)
+    result_q: queue.Queue = queue.Queue()
+    error_box: list[Exception] = []
+
+    def worker():
+        while True:
+            item = work_q.get()
+            if item is None:
+                work_q.task_done()
+                break
+            seq, ids, texts = item
+            try:
+                vecs = embed_batch(client, model, texts, logger)
+                result_q.put((seq, ids, vecs))
+            except Exception as e:
+                error_box.append(e)
+                result_q.put((seq, ids, None))   # signal failure
+            finally:
+                work_q.task_done()
+
+    threads = [threading.Thread(target=worker, daemon=True)
+               for _ in range(n_workers)]
+    for t in threads:
+        t.start()
 
     t0   = time.perf_counter()
     pbar = tqdm(total=total_items, initial=already, desc=f"{split_name:<7}",
                 unit="doc", dynamic_ncols=True)
+
+    # Consumer: collect results in order, flush chunks
+    chunk_idx  = n_chunks_done
+    buf_vecs:  list[np.ndarray] = []
+    buf_ids:   list[str]        = []
+    pending:   dict[int, tuple] = {}   # out-of-order buffer
+    next_seq   = 0
+    total_sent = 0    # batches enqueued
+    total_recv = 0    # batches collected
+
+    def consume_ready():
+        nonlocal chunk_idx, buf_vecs, buf_ids, total_recv
+        while next_seq in pending:
+            ids, vecs = pending.pop(next_seq)
+            if vecs is None:
+                raise RuntimeError(f"worker failed on batch seq={next_seq}")
+            buf_vecs.append(vecs)
+            buf_ids.extend(ids)
+            stats["batches"]  += 1
+            stats["embedded"] += len(ids)
+            pbar.update(len(ids))
+            total_recv += 1
+            if sum(v.shape[0] for v in buf_vecs) >= chunk_size:
+                flush_chunk(out_dir, chunk_idx, tag, buf_vecs, buf_ids)
+                logger.debug(f"  flushed chunk {chunk_idx}")
+                chunk_idx += 1
+                buf_vecs, buf_ids = [], []
+
+    # Producer: read items, build batches, enqueue
+    batch_texts: list[str] = []
+    batch_ids:   list[str] = []
     seen = 0
-
-    def flush_if_full():
-        nonlocal chunk_idx, buf_vecs, buf_ids
-        if sum(v.shape[0] for v in buf_vecs) >= chunk_size:
-            flush_chunk(out_dir, chunk_idx, tag, buf_vecs, buf_ids)
-            logger.debug(f"  flushed chunk {chunk_idx}")
-            chunk_idx += 1
-            buf_vecs, buf_ids = [], []
-
-    def flush_batch():
-        nonlocal batch_texts, batch_ids
-        if not batch_texts:
-            return
-        vecs = embed_batch(client, model, batch_texts, logger)
-        buf_vecs.append(vecs)
-        buf_ids.extend(batch_ids)
-        stats["batches"]  += 1
-        stats["embedded"] += len(batch_texts)
-        pbar.update(len(batch_texts))
-        batch_texts, batch_ids = [], []
-        flush_if_full()
 
     try:
         for item in items_iter_factory():
@@ -313,11 +354,69 @@ def embed_split(
             batch_ids.append(item.ident)
             batch_texts.append(item.text if item.text else " ")
             if len(batch_texts) >= batch_size:
-                flush_batch()
-        flush_batch()
+                work_q.put((total_sent, batch_ids, batch_texts))
+                total_sent += 1
+                batch_texts, batch_ids = [], []
+                # drain results that have arrived
+                while not result_q.empty():
+                    seq, ids, vecs = result_q.get_nowait()
+                    pending[seq] = (ids, vecs)
+                next_seq_before = next_seq
+                while next_seq in pending:
+                    ids, vecs = pending.pop(next_seq)
+                    if vecs is None:
+                        raise RuntimeError("worker embed failed")
+                    buf_vecs.append(vecs)
+                    buf_ids.extend(ids)
+                    stats["batches"]  += 1
+                    stats["embedded"] += len(ids)
+                    pbar.update(len(ids))
+                    total_recv += 1
+                    if sum(v.shape[0] for v in buf_vecs) >= chunk_size:
+                        flush_chunk(out_dir, chunk_idx, tag, buf_vecs, buf_ids)
+                        logger.debug(f"  flushed chunk {chunk_idx}")
+                        chunk_idx += 1
+                        buf_vecs, buf_ids = [], []
+                    next_seq += 1  # noqa: SIM113
+
+        # flush remaining partial batch
+        if batch_texts:
+            work_q.put((total_sent, batch_ids, batch_texts))
+            total_sent += 1
+
+        # signal workers to stop
+        for _ in threads:
+            work_q.put(None)
+        for t in threads:
+            t.join()
+
+        # drain result queue
+        while total_recv < total_sent:
+            seq, ids, vecs = result_q.get()
+            pending[seq] = (ids, vecs)
+            while next_seq in pending:
+                ids2, vecs2 = pending.pop(next_seq)
+                if vecs2 is None:
+                    raise RuntimeError("worker embed failed")
+                buf_vecs.append(vecs2)
+                buf_ids.extend(ids2)
+                stats["batches"]  += 1
+                stats["embedded"] += len(ids2)
+                pbar.update(len(ids2))
+                total_recv += 1
+                if sum(v.shape[0] for v in buf_vecs) >= chunk_size:
+                    flush_chunk(out_dir, chunk_idx, tag, buf_vecs, buf_ids)
+                    logger.debug(f"  flushed chunk {chunk_idx}")
+                    chunk_idx += 1
+                    buf_vecs, buf_ids = [], []
+                next_seq += 1
+
         if buf_vecs:
             flush_chunk(out_dir, chunk_idx, tag, buf_vecs, buf_ids)
+        if error_box:
+            raise error_box[0]
         done_marker.write_text("ok\n")
+
     finally:
         pbar.close()
 
@@ -360,6 +459,8 @@ def main():
     ap.add_argument("--tag",        default=None,
                     help="Chunk filename tag. Auto-derived from model if omitted.")
     ap.add_argument("--batch-size",    type=int, default=DEFAULT_BATCH)
+    ap.add_argument("--workers",       type=int, default=DEFAULT_WORKERS,
+                    help=f"Concurrent API calls in flight (default {DEFAULT_WORKERS}).")
     ap.add_argument("--chunk-batches", type=int, default=CHUNK_BATCHES)
     ap.add_argument("--skip-corpus",   action="store_true")
     ap.add_argument("--skip-queries",  action="store_true")
@@ -397,7 +498,7 @@ def main():
     logger.info(f"model      = {args.model}  (tag={tag}  expected_dim={expected_dim})")
     logger.info(f"data_dir   = {data_dir}")
     logger.info(f"output_dir = {out_dir}")
-    logger.info(f"batch_size = {args.batch_size}  chunk_batches = {args.chunk_batches}")
+    logger.info(f"batch_size = {args.batch_size}  workers = {args.workers}  chunk_batches = {args.chunk_batches}")
     logger.info(f"datasets   = {[d.name for d in datasets]}")
 
     run_start  = time.perf_counter()
@@ -418,7 +519,8 @@ def main():
             s = embed_split(client, args.model, tag, "corpus",
                             lambda: iter_corpus(corpus_file),
                             n, ds_out / "corpus",
-                            args.batch_size, args.chunk_batches, logger)
+                            args.batch_size, args.chunk_batches, logger,
+                            n_workers=args.workers)
             s["dataset"] = ds_name
             all_stats.append(s)
 
@@ -428,7 +530,8 @@ def main():
             s = embed_split(client, args.model, tag, "queries",
                             lambda: iter_queries(queries_file),
                             n, ds_out / "queries",
-                            args.batch_size, args.chunk_batches, logger)
+                            args.batch_size, args.chunk_batches, logger,
+                            n_workers=args.workers)
             s["dataset"] = ds_name
             all_stats.append(s)
 
