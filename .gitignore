@@ -28,7 +28,9 @@ eval_results/
 *.png
 embeddings_minilm/
 embeddings_vllm/
+embeddings_*/
 embed_beir_log_*.txt
 embed_beir_minilm_log_*.txt
 embed_beir_vllm_log_*.txt
+embed_beir_openrouter_log_*.txt
 embed_beir_hf_api_log_*.txt

@@ -1,30 +1,33 @@
 """
 Quantization evaluation on real BEIR embeddings.
 
-Addresses four questions:
-  1. Accuracy:     angle-quantization vs Cartesian-int8 -- which is better
-                   at the same bit budget?
-  2. int4 / int2:  is the quality gap over int8 significant?
-  3. Clipping:     what does "0-bit" (store only corpus mean) cost in quality?
-                   validates that CLIPPED angles carry negligible information.
-  4. Tradeoff:     generates a Compression-ratio vs NDCG@10 plot (PNG + CSV).
+Pipeline under test:
+    embedding (float32) -> hyperspherical angles -> quantize angles (int8 / int4 / int2 / 0-bit)
+
+Four questions:
+  1. Accuracy:   angle->int8 vs embedding->int8 (same budget, which representation wins?)
+  2. Redundancy: is int4/int2 a meaningful step over int8, or are intermediate precisions
+                 made redundant by truncation (0-bit clipping of low-sensitivity angles)?
+  3. Clipping:   0-bit angles are replaced by the corpus mean at query time -- sweep the
+                 fraction of angles clipped to find the accuracy cliff.
+  4. Tradeoff:   compression ratio vs NDCG@10 plot across all schemes.
 
 Inputs:
-  --embed-dir   root of chunked embedding output (e.g. embeddings/fever)
-                expects sub-dirs corpus/ and queries/ with chunk_*.npy files.
-  --data-dir    BEIR dataset directory (e.g. bier-data/fever)
-                reads qrels/test.tsv (falls back to dev.tsv then train.tsv).
-  --embed-tag   filename tag to glob for (e.g. "" for OAI, "minilm-l6-vllm")
+  --embed-dir   chunked embedding root for one dataset (e.g. embeddings/fever)
+                expects corpus/ and queries/ sub-dirs with chunk_*.npy files.
+  --data-dir    BEIR dataset dir (e.g. bier-data/fever), used to load qrels.
+  --embed-tag   chunk filename tag ("" for OAI plain layout, "minilm-l6-vllm" etc.)
 
 Memory:
-  Full FEVER corpus (5.4M x 1536 x fp32) = ~33 GB. Use --max-corpus to
-  sample a manageable subset for machines with limited RAM (default 200_000).
-  Queries with no relevant doc in the sample are dropped automatically.
+  Full FEVER (5.4M x 1536 x fp32) ~33 GB. Use --max-corpus to subsample.
+  Default 50k is safe on t3.medium (4 GB). Use a large-RAM machine for full-corpus.
 
-Outputs:
-  results_table.txt    -- human-readable metrics table
-  results.csv          -- machine-readable metrics
-  tradeoff.png         -- compression ratio vs NDCG@10 plot
+Outputs (in --output-dir):
+  results_table.txt    human-readable metrics table
+  results.csv          machine-readable
+  plot_main.png        Cartesian vs Angle at int8/int4/int2 (TODO 1 & 2)
+  plot_clipping.png    NDCG@10 vs fraction of angles clipped (TODO 3)
+  plot_tradeoff.png    compression ratio vs NDCG@10 for all schemes (TODO 4)
 """
 
 from __future__ import annotations
@@ -35,14 +38,14 @@ import gc
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
 
 # ---------------------------------------------------------------------------
 # Chunk loading
@@ -50,27 +53,22 @@ import numpy as np
 
 def _glob_chunks(split_dir: Path, tag: str) -> list[Path]:
     if tag:
-        chunks = sorted(split_dir.glob(f"chunk_*.{tag}.npy"))
-    else:
-        # no tag -- original OAI layout: chunk_XXXXXXX.npy (no extra dot-segment)
-        chunks = sorted(p for p in split_dir.glob("chunk_*.npy")
-                        if p.name.count(".") == 1)
-    return chunks
+        return sorted(split_dir.glob(f"chunk_*.{tag}.npy"))
+    return sorted(p for p in split_dir.glob("chunk_*.npy")
+                  if p.name.count(".") == 1)
 
 
 def load_split(split_dir: Path, tag: str,
                max_vecs: int | None = None) -> tuple[np.ndarray, list[str]]:
-    """Load all chunks for a split. Returns (vecs float32, ids list)."""
     chunks = _glob_chunks(split_dir, tag)
     if not chunks:
         raise FileNotFoundError(
             f"No chunks found in {split_dir} with tag='{tag}'. "
             f"Check --embed-tag and that embeddings exist.")
-
     all_vecs: list[np.ndarray] = []
     all_ids:  list[str] = []
     for p in chunks:
-        arr = np.load(p)
+        arr  = np.load(p)
         stem = p.name[:-len(".npy")]
         ids_p = split_dir / (stem + ".ids.txt")
         with ids_p.open("r", encoding="utf-8") as f:
@@ -80,11 +78,9 @@ def load_split(split_dir: Path, tag: str,
         all_ids.extend(ids)
         if max_vecs and sum(v.shape[0] for v in all_vecs) >= max_vecs:
             break
-
     vecs = np.concatenate(all_vecs, axis=0).astype(np.float32)
     if max_vecs:
-        vecs = vecs[:max_vecs]
-        all_ids = all_ids[:max_vecs]
+        vecs, all_ids = vecs[:max_vecs], all_ids[:max_vecs]
     return vecs, all_ids
 
 
@@ -93,7 +89,6 @@ def load_split(split_dir: Path, tag: str,
 # ---------------------------------------------------------------------------
 
 def load_qrels(data_dir: Path) -> dict[str, dict[str, int]]:
-    """Returns {query_id: {corpus_id: relevance_score}}."""
     qrels_dir = data_dir / "qrels"
     for name in ("test.tsv", "dev.tsv", "train.tsv"):
         p = qrels_dir / name
@@ -102,14 +97,11 @@ def load_qrels(data_dir: Path) -> dict[str, dict[str, int]]:
             break
     else:
         raise FileNotFoundError(f"No qrels file found in {qrels_dir}")
-
     qrels: dict[str, dict[str, int]] = {}
     with p.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
-            qid  = row["query-id"]
-            cid  = row["corpus-id"]
-            score = int(row["score"])
+            qid, cid, score = row["query-id"], row["corpus-id"], int(row["score"])
             if score > 0:
                 qrels.setdefault(qid, {})[cid] = score
     return qrels
@@ -120,19 +112,14 @@ def load_qrels(data_dir: Path) -> dict[str, dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 def dcg(relevances: list[int], k: int) -> float:
-    s = 0.0
-    for i, r in enumerate(relevances[:k], start=1):
-        s += r / math.log2(i + 1)
-    return s
+    return sum(r / math.log2(i + 2) for i, r in enumerate(relevances[:k]))
 
 
 def ndcg_at_k(top_ids: np.ndarray, relevant: dict[str, int], k: int) -> float:
-    rels = [relevant.get(cid, 0) for cid in top_ids[:k]]
+    rels  = [relevant.get(cid, 0) for cid in top_ids[:k]]
     ideal = sorted(relevant.values(), reverse=True)
-    idcg = dcg(ideal, k)
-    if idcg == 0:
-        return 0.0
-    return dcg(rels, k) / idcg
+    idcg  = dcg(ideal, k)
+    return dcg(rels, k) / idcg if idcg > 0 else 0.0
 
 
 def recall_at_k(top_ids: np.ndarray, relevant: dict[str, int], k: int) -> float:
@@ -143,503 +130,385 @@ def recall_at_k(top_ids: np.ndarray, relevant: dict[str, int], k: int) -> float:
 @dataclass
 class EvalResult:
     label: str
+    group: str          # cartesian | angle-uniform | angle-truncation | clipping
     bits_per_vec: int
-    dim: int
     ndcg10: float
     recall100: float
-    score_ms: float       # total scoring time
-    family: str = ""      # for plot grouping
+    score_ms: float
 
 
 def evaluate(
-    label: str,
-    bits_per_vec: int,
-    q_vecs: np.ndarray,         # (Q, d) unit
-    c_vecs: np.ndarray,         # (C, d) unit
-    q_ids: list[str],
-    c_ids: list[str],
+    label: str, group: str, bits_per_vec: int,
+    q_vecs: np.ndarray, c_vecs: np.ndarray,
+    q_ids: list[str], c_ids: list[str],
     qrels: dict[str, dict[str, int]],
-    k_ndcg: int = 10,
-    k_recall: int = 100,
-    batch_q: int = 512,
-    family: str = "",
+    batch_q: int = 256,
 ) -> EvalResult:
-    """Score queries in batches; compute NDCG@10 and Recall@100."""
     c_ids_arr = np.array(c_ids)
-    top_k = max(k_ndcg, k_recall)
-
-    ndcg_scores:   list[float] = []
+    top_k = 100
+    ndcg_scores: list[float] = []
     recall_scores: list[float] = []
     t0 = time.perf_counter()
-
     for qi in range(0, len(q_ids), batch_q):
-        q_batch = q_vecs[qi: qi + batch_q]          # (B, d)
-        sims = q_batch @ c_vecs.T                    # (B, C)
-        top_idx = np.argpartition(-sims, kth=min(top_k, sims.shape[1] - 1),
-                                  axis=1)[:, :top_k]
-        # sort each row
+        q_batch = q_vecs[qi: qi + batch_q]
+        sims    = q_batch @ c_vecs.T
+        top_idx = np.argpartition(-sims, kth=min(top_k, sims.shape[1] - 1), axis=1)[:, :top_k]
         for bi in range(q_batch.shape[0]):
             qid = q_ids[qi + bi]
             relevant = qrels.get(qid)
             if not relevant:
                 continue
-            row_sims = sims[bi, top_idx[bi]]
-            order = np.argsort(-row_sims)
-            ranked_ids = c_ids_arr[top_idx[bi][order]]
-            ndcg_scores.append(ndcg_at_k(ranked_ids, relevant, k_ndcg))
-            recall_scores.append(recall_at_k(ranked_ids, relevant, k_recall))
-
+            row_sims  = sims[bi, top_idx[bi]]
+            order     = np.argsort(-row_sims)
+            ranked    = c_ids_arr[top_idx[bi][order]]
+            ndcg_scores.append(ndcg_at_k(ranked, relevant, 10))
+            recall_scores.append(recall_at_k(ranked, relevant, 100))
     elapsed = time.perf_counter() - t0
     return EvalResult(
-        label=label,
-        bits_per_vec=bits_per_vec,
-        dim=q_vecs.shape[1],
-        ndcg10=float(np.mean(ndcg_scores))   if ndcg_scores   else 0.0,
+        label=label, group=group, bits_per_vec=bits_per_vec,
+        ndcg10=float(np.mean(ndcg_scores))    if ndcg_scores    else 0.0,
         recall100=float(np.mean(recall_scores)) if recall_scores else 0.0,
         score_ms=elapsed * 1000,
-        family=family,
     )
 
 
 # ---------------------------------------------------------------------------
-# Quantization helpers (self-contained, no imports from geo*.py)
+# Coordinate conversion  (float32 throughout to halve memory vs float64)
 # ---------------------------------------------------------------------------
 
-# -- Cartesian scalar quantization --
-
-def cartesian_quant(vecs: np.ndarray, bits: int) -> np.ndarray:
-    """Uniform scalar quantization of Cartesian unit vectors. Returns float32."""
-    levels = (1 << bits)
-    scale  = (levels - 1) / 2.0           # maps [-1, 1] -> [0, levels-1]
-    q = np.round(np.clip(vecs, -1.0, 1.0) * scale).astype(np.int32)
-    q = np.clip(q, 0, levels - 1)
-    out = (q.astype(np.float32) / scale) - 1.0  # not quite right; use midpoint below
-    # midpoint dequant
-    out = (q.astype(np.float32) + 0.5) / scale - 1.0
-    norms = np.linalg.norm(out, axis=1, keepdims=True)
-    return out / np.clip(norms, 1e-12, None)
-
-
-# -- Hyperspherical conversion --
-
-def cartesian_to_hyperspherical(x: np.ndarray) -> np.ndarray:
-    """float32 throughout -- halves peak memory vs float64 with negligible precision loss."""
+def to_angles(x: np.ndarray) -> np.ndarray:
     x = x.astype(np.float32, copy=False)
-    N, n = x.shape
-    angles = np.zeros((N, n - 1), dtype=np.float32)
-    sq = x ** 2
-    rev_cumsum = np.cumsum(sq[:, ::-1], axis=1)[:, ::-1]
-    tail = np.sqrt(np.clip(rev_cumsum, 0.0, None))
-    del sq, rev_cumsum
+    N, n  = x.shape
+    out   = np.zeros((N, n - 1), dtype=np.float32)
+    sq    = x ** 2
+    tail  = np.sqrt(np.clip(np.cumsum(sq[:, ::-1], axis=1)[:, ::-1], 0.0, None))
+    del sq
     for i in range(n - 2):
-        denom = np.clip(tail[:, i], 1e-7, None)
-        ratio = np.clip(x[:, i] / denom, -1.0, 1.0)
-        angles[:, i] = np.arccos(ratio)
+        out[:, i] = np.arccos(np.clip(x[:, i] / np.clip(tail[:, i], 1e-7, None), -1.0, 1.0))
     last = np.arctan2(x[:, n - 1], x[:, n - 2])
-    angles[:, n - 2] = np.where(last < 0, last + 2 * math.pi, last)
+    out[:, n - 2] = np.where(last < 0, last + 2 * math.pi, last)
     del tail, last
-    return angles
-
-
-def hyperspherical_to_cartesian(angles: np.ndarray) -> np.ndarray:
-    angles = angles.astype(np.float32, copy=False)
-    N, m = angles.shape
-    n = m + 1
-    x = np.zeros((N, n), dtype=np.float32)
-    sin_prod = np.ones(N, dtype=np.float32)
-    for i in range(m):
-        x[:, i] = sin_prod * np.cos(angles[:, i])
-        sin_prod = sin_prod * np.sin(angles[:, i])
-    x[:, n - 1] = sin_prod
-    return x
-
-
-def recon_from_angles(angles: np.ndarray) -> np.ndarray:
-    x = hyperspherical_to_cartesian(angles).astype(np.float32)
-    norms = np.linalg.norm(x, axis=1, keepdims=True)
-    return x / np.clip(norms, 1e-12, None)
-
-
-# -- Uniform angle quantization --
-
-def angle_uniform_quant(angles: np.ndarray, bits_per_angle: int) -> np.ndarray:
-    M  = angles.shape[1]
-    hi = np.full(M, math.pi, dtype=np.float32)
-    hi[-1] = 2 * math.pi
-    levels = 1 << bits_per_angle
-    q = np.floor(np.clip(angles, 0.0, hi - 1e-6) / hi * levels).astype(np.int32)
-    q = np.clip(q, 0, levels - 1)
-    return (q.astype(np.float32) + 0.5) * (hi / levels)
-
-
-# -- Jacobian-aware bit allocation (from geometry.py) --
-
-def jacobian_bit_allocation(n_angles: int, total_bits: int,
-                             empirical_std: np.ndarray | None = None,
-                             min_bits: int = 0, max_bits: int = 16) -> np.ndarray:
-    if empirical_std is not None:
-        log_std = np.log2(np.clip(empirical_std, 1e-6, None))
-        importance = log_std - log_std.min() + 0.1
-    else:
-        importance = np.array([math.sqrt(n_angles - i) for i in range(n_angles)])
-
-    weights = importance / importance.sum()
-    ideal   = weights * total_bits
-    bits    = np.clip(np.floor(ideal).astype(np.int32), min_bits, max_bits)
-    remaining = int(total_bits - bits.sum())
-    guard = 0
-    max_iters = n_angles * max_bits * 4
-    while remaining != 0 and guard < max_iters:
-        residual = ideal - bits
-        if remaining > 0:
-            mask = bits < max_bits
-            if not mask.any():
-                break
-            j = int(np.argmax(np.where(mask, residual, -np.inf)))
-            bits[j] += 1; remaining -= 1
-        else:
-            mask = bits > min_bits
-            if not mask.any():
-                break
-            j = int(np.argmin(np.where(mask, residual, np.inf)))
-            bits[j] -= 1; remaining += 1
-        guard += 1
-    return bits
-
-
-def angle_jacobian_quant(angles: np.ndarray, bits_arr: np.ndarray) -> np.ndarray:
-    M  = angles.shape[1]
-    hi = np.full(M, math.pi, dtype=np.float32)
-    hi[-1] = 2 * math.pi
-    levels = (1 << bits_arr.astype(np.int32))
-    a = np.clip(angles, 0.0, hi - 1e-6)
-    q = np.clip(np.floor(a / hi * levels).astype(np.int32), 0, levels - 1)
-    del a
-    deq = np.zeros_like(angles, dtype=np.float32)
-    for i in range(M):
-        if bits_arr[i] == 0:
-            deq[:, i] = hi[i] / 2.0
-        else:
-            deq[:, i] = (q[:, i].astype(np.float32) + 0.5) * (hi[i] / levels[i])
-    del q
-    return deq
-
-
-# -- Dynamic tier assignment (from geo2.py) --
-
-TIER_BITS_ARR = [0, 2, 4, 8, 16, 32]   # indexed by tier id 0..5
-
-def estimate_sensitivity(angles_calib: np.ndarray) -> np.ndarray:
-    a = angles_calib.astype(np.float32, copy=False)
-    log_sin2 = 2.0 * np.log(np.clip(np.sin(a), 1e-7, None))
-    cum = np.zeros_like(log_sin2)
-    cum[:, 1:] = np.cumsum(log_sin2[:, :-1], axis=1)
-    mean_log = cum.mean(axis=0)
-    del cum, log_sin2
-    sens = np.exp(mean_log - mean_log.max())
-    return sens
-
-
-def assign_tiers(sensitivity: np.ndarray, total_bits: int,
-                 angle_ranges: np.ndarray) -> np.ndarray:
-    M = len(sensitivity)
-    ladder_bits = TIER_BITS_ARR
-
-    def distortion(tier_bits: int, r: float) -> float:
-        if tier_bits == 0:
-            return (r * r) / 12.0
-        if tier_bits <= 8:
-            w = r / (1 << tier_bits)
-            return (w * w) / 12.0
-        if tier_bits == 16:
-            return (r * (2.0 ** -10)) ** 2 / 12.0
-        return (r * (2.0 ** -23)) ** 2 / 12.0
-
-    tiers  = np.zeros(M, dtype=np.int32)
-    c_dist = np.array([sensitivity[i] * distortion(0, angle_ranges[i])
-                       for i in range(M)])
-    used   = 0
-
-    def step(i: int):
-        cur = tiers[i]
-        if cur >= len(ladder_bits) - 1:
-            return None
-        nxt = cur + 1
-        extra = ladder_bits[nxt] - ladder_bits[cur]
-        nd    = sensitivity[i] * distortion(ladder_bits[nxt], angle_ranges[i])
-        gain  = c_dist[i] - nd
-        return (gain / extra if extra > 0 else -np.inf, extra, nxt, nd)
-
-    opts = [step(i) for i in range(M)]
-    while used < total_bits:
-        best_i, best_ratio, best_t = -1, -np.inf, None
-        for i, o in enumerate(opts):
-            if o is None:
-                continue
-            if o[1] > total_bits - used:
-                continue
-            if o[0] > best_ratio:
-                best_ratio, best_i, best_t = o[0], i, o
-        if best_i < 0 or best_ratio <= 0:
-            break
-        _, extra, new_tier, new_d = best_t
-        tiers[best_i] = new_tier
-        c_dist[best_i] = new_d
-        used += extra
-        opts[best_i] = step(best_i)
-    return tiers
-
-
-def apply_tiers(angles: np.ndarray, tiers: np.ndarray,
-                angle_ranges: np.ndarray,
-                clip_means: np.ndarray) -> np.ndarray:
-    """Quantize then dequantize using per-angle tier assignment."""
-    N, M = angles.shape
-    out = np.empty((N, M), dtype=np.float32)
-    out[:] = clip_means[None, :].astype(np.float32)
-    for tier_id, bits in enumerate(TIER_BITS_ARR):
-        idx = np.where(tiers == tier_id)[0]
-        if not len(idx):
-            continue
-        if bits == 0:
-            continue  # already filled with clip_means
-        r_vec = angle_ranges[idx].astype(np.float32)
-        if bits <= 8:
-            levels = 1 << bits
-            a = np.clip(angles[:, idx], 0.0, r_vec - 1e-6)
-            q = np.clip(np.floor(a / r_vec * levels).astype(np.int32), 0, levels - 1)
-            out[:, idx] = (q.astype(np.float32) + 0.5) * (r_vec / levels)
-        elif bits == 16:
-            out[:, idx] = angles[:, idx].astype(np.float16).astype(np.float32)
-        else:
-            out[:, idx] = angles[:, idx].astype(np.float32)
     return out
 
 
-# -- Residual int8 (from geo3.py) --
-
-def residual_int8_stack(original: np.ndarray, stage1: np.ndarray) -> np.ndarray:
-    residual = original - stage1
-    r_max = float(np.abs(residual).max())
-    if r_max < 1e-12:
-        return stage1.copy()
-    levels = 127
-    scale  = r_max / levels
-    codes  = np.clip(np.round(residual / scale).astype(np.int32), -levels, levels).astype(np.int8)
-    recon  = stage1 + codes.astype(np.float32) * scale
-    norms  = np.linalg.norm(recon, axis=1, keepdims=True)
-    return recon / np.clip(norms, 1e-12, None)
+def from_angles(a: np.ndarray) -> np.ndarray:
+    a = a.astype(np.float32, copy=False)
+    N, m  = a.shape
+    x     = np.zeros((N, m + 1), dtype=np.float32)
+    sp    = np.ones(N, dtype=np.float32)
+    for i in range(m):
+        x[:, i] = sp * np.cos(a[:, i])
+        sp = sp * np.sin(a[:, i])
+    x[:, m] = sp
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    return x / np.clip(norms, 1e-7, None)
 
 
 # ---------------------------------------------------------------------------
-# Run all schemes
+# Quantization primitives
 # ---------------------------------------------------------------------------
 
-BIT_BUDGETS = [1536, 3072, 4608, 6144, 9216, 12288]
+def quant_cartesian(vecs: np.ndarray, bits: int) -> np.ndarray:
+    """Uniform scalar quantization of Cartesian unit vectors."""
+    levels = 1 << bits
+    scale  = (levels - 1) / 2.0
+    q = np.clip(np.round(np.clip(vecs, -1.0, 1.0) * scale + scale / 2), 0, levels - 1).astype(np.int32)
+    out = (q.astype(np.float32) + 0.5) / scale - 1.0
+    norms = np.linalg.norm(out, axis=1, keepdims=True)
+    return out / np.clip(norms, 1e-7, None)
 
+
+def quant_angles_uniform(angles: np.ndarray, bits: int,
+                          hi: np.ndarray) -> np.ndarray:
+    """Uniform scalar quantization of all angles at `bits` bits each."""
+    levels = 1 << bits
+    a = np.clip(angles, 0.0, hi - 1e-6)
+    q = np.clip(np.floor(a / hi * levels).astype(np.int32), 0, levels - 1)
+    return (q.astype(np.float32) + 0.5) * (hi / levels)
+
+
+def quant_angles_truncation(angles: np.ndarray, hi: np.ndarray,
+                             keep_bits: int, keep_n: int,
+                             clip_means: np.ndarray) -> np.ndarray:
+    """
+    Truncation scheme: keep the first `keep_n` angles at `keep_bits` bits,
+    clip the rest to their corpus mean (0-bit).
+
+    This is the core of the proposal: early angles (high Jacobian weight)
+    are kept at full precision; late angles (low sensitivity) are dropped.
+    """
+    out = clip_means[None, :].repeat(angles.shape[0], axis=0).astype(np.float32)
+    if keep_n > 0:
+        out[:, :keep_n] = quant_angles_uniform(angles[:, :keep_n],
+                                                keep_bits, hi[:keep_n])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main evaluation
+# ---------------------------------------------------------------------------
 
 def run_all(
-    c_vecs: np.ndarray,
-    q_vecs: np.ndarray,
-    c_ids: list[str],
-    q_ids: list[str],
+    c_vecs: np.ndarray, q_vecs: np.ndarray,
+    c_ids: list[str], q_ids: list[str],
     qrels: dict[str, dict[str, int]],
-    out_dir: Path,
-) -> list[EvalResult]:
-    dim     = c_vecs.shape[1]
+    batch_q: int,
+) -> tuple[list[EvalResult], list[EvalResult]]:
+    dim      = c_vecs.shape[1]
     n_angles = dim - 1
-    results: list[EvalResult] = []
+    results:  list[EvalResult] = []
+    clipping: list[EvalResult] = []   # separate: used for clipping plot
 
-    def ev(label, bits, cv, qv, family=""):
-        print(f"  evaluating: {label} ...")
-        r = evaluate(label, bits, qv, cv, q_ids, c_ids, qrels, family=family)
+    def ev(label, group, bits, cv, qv):
+        print(f"  {label} ...")
+        r = evaluate(label, group, bits, qv, cv, q_ids, c_ids, qrels, batch_q)
         print(f"    NDCG@10={r.ndcg10:.4f}  R@100={r.recall100:.4f}  {r.score_ms/1000:.1f}s")
-        results.append(r)
         return r
 
-    # ---- 1. Float32 baseline ----
-    ev("float32 baseline", 32 * dim, c_vecs, q_vecs, family="baseline")
+    # -----------------------------------------------------------------------
+    # Baseline
+    # -----------------------------------------------------------------------
+    results.append(ev("float32 baseline", "baseline", 32 * dim, c_vecs, q_vecs))
 
-    # ---- 2. Cartesian int quantization ----
-    for bits, label in [(8, "Cartesian int8"), (4, "Cartesian int4"), (2, "Cartesian int2")]:
-        cv = cartesian_quant(c_vecs, bits)
-        qv = cartesian_quant(q_vecs, bits)
-        ev(label, bits * dim, cv, qv, family="cartesian")
-        del cv, qv;  gc.collect()
+    # -----------------------------------------------------------------------
+    # TODO 1 & 2 -- Cartesian int vs Angle int at matched bit budgets
+    # -----------------------------------------------------------------------
+    print("\n--- Cartesian quantization ---")
+    for bits in (8, 4, 2):
+        cv = quant_cartesian(c_vecs, bits)
+        qv = quant_cartesian(q_vecs, bits)
+        results.append(ev(f"Cartesian int{bits}",
+                          "cartesian", bits * dim, cv, qv))
+        del cv, qv; gc.collect()
 
-    # ---- 3. Convert to angles (shared for all angle schemes) ----
-    print("\nConverting corpus to hyperspherical angles (may take a few minutes) ...")
-    t0 = time.perf_counter()
-    c_angles = cartesian_to_hyperspherical(c_vecs)
-    q_angles = cartesian_to_hyperspherical(q_vecs)
-    gc.collect()
-    print(f"  done in {time.perf_counter()-t0:.1f}s")
-
-    rt_err = float(np.mean(np.linalg.norm(
-        recon_from_angles(c_angles[:500]) - c_vecs[:500], axis=1)))
-    print(f"  round-trip L2 error (first 500): {rt_err:.2e}")
-
-    emp_std      = c_angles.std(axis=0)
-    angle_means  = c_angles.mean(axis=0)
-    angle_ranges = np.full(n_angles, math.pi, dtype=np.float32)
-    angle_ranges[-1] = 2 * math.pi
-    sens = estimate_sensitivity(c_angles)
-    gc.collect()
-
-    # ---- 4. CLIPPING VALIDATION: 0-bit (all angles at corpus mean) ----
-    print("\n--- Clipping validation ---")
-    clip_cv = recon_from_angles(np.broadcast_to(angle_means, c_angles.shape).copy())
-    clip_qv = recon_from_angles(np.broadcast_to(angle_means, q_angles.shape).copy())
-    ev("CLIPPED (0-bit, all @ mean)", 0, clip_cv, clip_qv, family="clipping")
-    del clip_cv, clip_qv;  gc.collect()
-
-    half_angles_c = c_angles.copy()
-    half_angles_c[:, n_angles // 2:] = angle_means[n_angles // 2:]
-    half_angles_q = q_angles.copy()
-    half_angles_q[:, n_angles // 2:] = angle_means[n_angles // 2:]
-    hcv = recon_from_angles(half_angles_c);  del half_angles_c
-    hqv = recon_from_angles(half_angles_q);  del half_angles_q
-    ev("CLIPPED last 50% angles", 0, hcv, hqv, family="clipping")
-    del hcv, hqv;  gc.collect()
-
-    # ---- 5. Angle-uniform sweep ----
     print("\n--- Angle uniform quantization ---")
-    for budget in BIT_BUDGETS:
-        avg_bits = max(1, budget // n_angles)
-        deq_c = angle_uniform_quant(c_angles, avg_bits)
-        deq_q = angle_uniform_quant(q_angles, avg_bits)
-        cv = recon_from_angles(deq_c);  del deq_c
-        qv = recon_from_angles(deq_q);  del deq_q
-        ev(f"angle-uniform {avg_bits}b/angle ({budget}b total)", budget, cv, qv, family="angle-uniform")
-        del cv, qv;  gc.collect()
+    hi = np.full(n_angles, math.pi, dtype=np.float32)
+    hi[-1] = 2 * math.pi
+    print("  converting to angles ...")
+    c_angles = to_angles(c_vecs)
+    q_angles = to_angles(q_vecs)
+    clip_means = c_angles.mean(axis=0)
+    gc.collect()
 
-    # ---- 6. Jacobian-aware sweep (propagation prior) ----
-    print("\n--- Angle Jacobian-prior quantization ---")
-    for budget in BIT_BUDGETS:
-        bits_arr = jacobian_bit_allocation(n_angles, budget)
-        deq_c = angle_jacobian_quant(c_angles, bits_arr)
-        deq_q = angle_jacobian_quant(q_angles, bits_arr)
-        cv = recon_from_angles(deq_c);  del deq_c
-        qv = recon_from_angles(deq_q);  del deq_q
-        ev(f"angle-jacobian {budget}b (min={bits_arr.min()} med={int(np.median(bits_arr))} max={bits_arr.max()})",
-           int(bits_arr.sum()), cv, qv, family="angle-jacobian")
-        del cv, qv;  gc.collect()
+    for bits in (8, 4, 2):
+        deq_c = quant_angles_uniform(c_angles, bits, hi)
+        deq_q = quant_angles_uniform(q_angles, bits, hi)
+        cv = from_angles(deq_c); del deq_c
+        qv = from_angles(deq_q); del deq_q
+        results.append(ev(f"Angle int{bits} (uniform)",
+                          "angle-uniform", bits * n_angles, cv, qv))
+        del cv, qv; gc.collect()
 
-    # ---- 7. Empirical-std bit allocation ----
-    print("\n--- Angle empirical-std quantization ---")
-    for budget in BIT_BUDGETS:
-        bits_arr = jacobian_bit_allocation(n_angles, budget, empirical_std=emp_std)
-        deq_c = angle_jacobian_quant(c_angles, bits_arr)
-        deq_q = angle_jacobian_quant(q_angles, bits_arr)
-        cv = recon_from_angles(deq_c);  del deq_c
-        qv = recon_from_angles(deq_q);  del deq_q
-        ev(f"angle-emp-std {budget}b", int(bits_arr.sum()), cv, qv, family="angle-emp-std")
-        del cv, qv;  gc.collect()
+    # -----------------------------------------------------------------------
+    # TODO 3 -- Clipping sweep
+    # Fraction of angles clipped (last k% replaced by corpus mean).
+    # Remaining angles kept at int8.
+    # -----------------------------------------------------------------------
+    print("\n--- Clipping sweep (remaining angles at int8) ---")
+    clip_fractions = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    for frac in clip_fractions:
+        keep_n = int(round(n_angles * (1.0 - frac)))
+        # bits stored = keep_n * 8; rest is free (corpus mean shared)
+        stored_bits = keep_n * 8
+        deq_c = quant_angles_truncation(c_angles, hi, 8, keep_n, clip_means)
+        deq_q = quant_angles_truncation(q_angles, hi, 8, keep_n, clip_means)
+        cv = from_angles(deq_c); del deq_c
+        qv = from_angles(deq_q); del deq_q
+        label = (f"Clip {int(frac*100):3d}% angles  "
+                 f"(keep {keep_n}/{n_angles} @ int8 = {stored_bits} bits)")
+        r = ev(label, "clipping", stored_bits, cv, qv)
+        clipping.append(r)
+        results.append(r)
+        del cv, qv; gc.collect()
 
-    # ---- 8. Dynamic tier ----
-    print("\n--- Dynamic tier quantization ---")
-    for budget in BIT_BUDGETS:
-        tiers_arr   = assign_tiers(sens, budget, angle_ranges)
-        actual_bits = int(sum(TIER_BITS_ARR[t] for t in tiers_arr))
-        deq_c = apply_tiers(c_angles, tiers_arr, angle_ranges, angle_means)
-        deq_q = apply_tiers(q_angles, tiers_arr, angle_ranges, angle_means)
-        cv = recon_from_angles(deq_c);  del deq_c
-        qv = recon_from_angles(deq_q);  del deq_q
-        ev(f"dyn-tier {budget}b (actual={actual_bits}b)", actual_bits, cv, qv, family="dyn-tier")
+    # -----------------------------------------------------------------------
+    # TODO 4 -- Truncation tradeoff
+    # Vary how many angles are kept (at int8) vs clipped; also sweep int4/int2
+    # for the kept angles to show redundancy of sub-int8 precision.
+    # -----------------------------------------------------------------------
+    print("\n--- Truncation tradeoff sweep ---")
+    keep_fracs = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    for keep_bits in (8, 4, 2):
+        for kf in keep_fracs:
+            keep_n      = int(round(n_angles * kf))
+            stored_bits = keep_n * keep_bits
+            deq_c = quant_angles_truncation(c_angles, hi, keep_bits, keep_n, clip_means)
+            deq_q = quant_angles_truncation(q_angles, hi, keep_bits, keep_n, clip_means)
+            cv = from_angles(deq_c); del deq_c
+            qv = from_angles(deq_q); del deq_q
+            label = f"Truncation int{keep_bits} keep={int(kf*100)}%"
+            group = f"truncation-int{keep_bits}"
+            results.append(ev(label, group, stored_bits, cv, qv))
+            del cv, qv; gc.collect()
 
-        # ---- 9. Residual int8 on top of dynamic tier ----
-        cv_stack = residual_int8_stack(c_vecs, cv)
-        qv_stack = residual_int8_stack(q_vecs, qv)
-        del cv, qv;  gc.collect()
-        ev(f"dyn-tier {budget}b + residual-int8",
-           actual_bits + 8 * dim, cv_stack, qv_stack, family="dyn-tier+residual")
-        del cv_stack, qv_stack;  gc.collect()
-
-    return results
+    del c_angles, q_angles; gc.collect()
+    return results, clipping
 
 
 # ---------------------------------------------------------------------------
-# Output
+# Outputs
 # ---------------------------------------------------------------------------
 
 def write_table(results: list[EvalResult], path: Path) -> None:
-    float32_bits = next((r.bits_per_vec for r in results if "float32" in r.label), 1)
-    header = f"{'method':<60} {'bits/vec':>10} {'ratio':>7} {'NDCG@10':>9} {'R@100':>8} {'score_s':>9}"
-    sep    = "-" * len(header)
-    lines  = [header, sep]
+    base_bits = next((r.bits_per_vec for r in results if "float32" in r.label), 1)
+    header = (f"{'method':<65} {'bits/vec':>10} {'ratio':>7} "
+              f"{'NDCG@10':>9} {'R@100':>8} {'score_s':>9}")
+    lines = [header, "-" * len(header)]
     for r in results:
-        ratio = float32_bits / r.bits_per_vec if r.bits_per_vec > 0 else float("inf")
+        ratio = base_bits / r.bits_per_vec if r.bits_per_vec > 0 else float("inf")
         lines.append(
-            f"{r.label:<60} {r.bits_per_vec:>10d} {ratio:>7.1f}x "
-            f"{r.ndcg10:>9.4f} {r.recall100:>8.4f} {r.score_ms/1000:>9.2f}"
-        )
+            f"{r.label:<65} {r.bits_per_vec:>10d} {ratio:>7.1f}x "
+            f"{r.ndcg10:>9.4f} {r.recall100:>8.4f} {r.score_ms/1000:>9.2f}")
     text = "\n".join(lines)
     print("\n" + text)
     path.write_text(text + "\n", encoding="utf-8")
-    print(f"\ntable written to: {path}")
+    print(f"\ntable -> {path}")
 
 
 def write_csv(results: list[EvalResult], path: Path) -> None:
+    base_bits = next((r.bits_per_vec for r in results if "float32" in r.label), 1)
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["label", "family", "bits_per_vec", "compression_ratio",
+        w.writerow(["label", "group", "bits_per_vec", "compression_ratio",
                     "ndcg10", "recall100", "score_ms"])
-        float32_bits = next((r.bits_per_vec for r in results if "float32" in r.label), 1)
         for r in results:
-            ratio = float32_bits / r.bits_per_vec if r.bits_per_vec > 0 else float("inf")
-            w.writerow([r.label, r.family, r.bits_per_vec, f"{ratio:.3f}",
+            ratio = base_bits / r.bits_per_vec if r.bits_per_vec > 0 else float("inf")
+            w.writerow([r.label, r.group, r.bits_per_vec, f"{ratio:.3f}",
                         f"{r.ndcg10:.4f}", f"{r.recall100:.4f}", f"{r.score_ms:.1f}"])
-    print(f"CSV  written to: {path}")
+    print(f"CSV  -> {path}")
+
+
+def plot_main(results: list[EvalResult], path: Path) -> None:
+    """TODO 1 & 2: Cartesian int vs Angle uniform at int8/int4/int2."""
+    base  = next(r for r in results if "float32" in r.label)
+    base_bits = base.bits_per_vec
+
+    cart  = [r for r in results if r.group == "cartesian"]
+    angle = [r for r in results if r.group == "angle-uniform"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    def ratio(r): return base_bits / r.bits_per_vec
+
+    ax.scatter([ratio(r) for r in cart],  [r.ndcg10 for r in cart],
+               color="#e74c3c", s=100, zorder=5, label="Cartesian int (8/4/2-bit)")
+    for r in cart:
+        ax.annotate(f"int{r.bits_per_vec // base.bits_per_vec * 32}",
+                    (ratio(r), r.ndcg10), textcoords="offset points",
+                    xytext=(6, 4), fontsize=8, color="#e74c3c")
+
+    ax.scatter([ratio(r) for r in angle], [r.ndcg10 for r in angle],
+               color="#2ecc71", s=100, marker="^", zorder=5,
+               label="Angle int (8/4/2-bit, uniform)")
+    for r in angle:
+        bits_per_angle = r.bits_per_vec // (base_bits // 32 - 1)
+        ax.annotate(f"int{bits_per_angle}",
+                    (ratio(r), r.ndcg10), textcoords="offset points",
+                    xytext=(6, 4), fontsize=8, color="#2ecc71")
+
+    ax.axhline(base.ndcg10, color="black", linestyle="--",
+               linewidth=1.2, label="float32 baseline")
+    ax.set_xlabel("Compression ratio (vs float32)", fontsize=12)
+    ax.set_ylabel("NDCG@10", fontsize=12)
+    ax.set_title("TODO 1 & 2: Cartesian int vs Angle int at matched budgets\n"
+                 "(higher = better; same x means same storage cost)", fontsize=11)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"plot  -> {path}")
+
+
+def plot_clipping(clipping: list[EvalResult], base_ndcg: float, path: Path) -> None:
+    """TODO 3: NDCG@10 vs fraction of angles clipped (0-bit)."""
+    # clipping list is ordered by frac 0.0 → 1.0
+    fracs = [1.0 - (r.bits_per_vec / clipping[0].bits_per_vec)
+             for r in clipping]
+    # recompute from label
+    fracs = []
+    for r in clipping:
+        import re
+        m = re.search(r"Clip\s+(\d+)%", r.label)
+        fracs.append(int(m.group(1)) / 100.0 if m else 0.0)
+
+    ndcgs = [r.ndcg10 for r in clipping]
+    bits  = [r.bits_per_vec for r in clipping]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(fracs, ndcgs, "o-", color="#3498db", linewidth=2, markersize=8)
+    ax1.axhline(base_ndcg, color="black", linestyle="--", linewidth=1.2,
+                label="float32 baseline")
+    ax1.set_xlabel("Fraction of angles clipped (replaced by corpus mean)", fontsize=11)
+    ax1.set_ylabel("NDCG@10", fontsize=11)
+    ax1.set_title("TODO 3: Clipping validation\n"
+                  "(how much can we clip before quality drops?)", fontsize=11)
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(bits, ndcgs, "o-", color="#9b59b6", linewidth=2, markersize=8)
+    ax2.axhline(base_ndcg, color="black", linestyle="--", linewidth=1.2,
+                label="float32 baseline")
+    ax2.set_xlabel("Bits stored per vector (remaining int8 angles only)", fontsize=11)
+    ax2.set_ylabel("NDCG@10", fontsize=11)
+    ax2.set_title("TODO 3: Bits stored vs quality", fontsize=11)
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+
+    fig.suptitle("Clipping ablation — keeping first k% angles at int8, rest at 0-bit",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"plot  -> {path}")
 
 
 def plot_tradeoff(results: list[EvalResult], path: Path) -> None:
-    float32_bits = next((r.bits_per_vec for r in results if "float32" in r.label), 1)
-    baseline_ndcg = next((r.ndcg10 for r in results if "float32" in r.label), 1.0)
+    """TODO 4: Compression ratio vs NDCG@10 for all schemes."""
+    base_bits = next((r.bits_per_vec for r in results if "float32" in r.label), 1)
+    base_ndcg = next((r.ndcg10       for r in results if "float32" in r.label), 1.0)
 
-    families = {
-        "cartesian":      ("Cartesian int (8/4/2-bit)",   "o",  "#e74c3c"),
-        "angle-uniform":  ("Angle uniform",                "s",  "#3498db"),
-        "angle-jacobian": ("Angle Jacobian-prior",         "^",  "#2ecc71"),
-        "angle-emp-std":  ("Angle empirical-std",          "D",  "#9b59b6"),
-        "dyn-tier":       ("Dynamic tier",                 "P",  "#f39c12"),
-        "dyn-tier+residual": ("Dyn-tier + residual int8",  "X",  "#1abc9c"),
-        "clipping":       ("Clipping experiments",         "v",  "#95a5a6"),
+    groups = {
+        "cartesian":         ("Cartesian int (8/4/2)", "o",  "#e74c3c"),
+        "angle-uniform":     ("Angle int uniform",     "^",  "#2ecc71"),
+        "truncation-int8":   ("Truncation int8",       "s",  "#3498db"),
+        "truncation-int4":   ("Truncation int4",       "D",  "#9b59b6"),
+        "truncation-int2":   ("Truncation int2",       "P",  "#f39c12"),
+        "clipping":          ("Clipping sweep",        "v",  "#95a5a6"),
     }
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    ax1, ax2 = axes
-
-    for fam, (name, marker, color) in families.items():
-        pts = [(float32_bits / r.bits_per_vec, r.ndcg10)
-               for r in results
-               if r.family == fam and r.bits_per_vec > 0]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    for group, (name, marker, color) in groups.items():
+        pts = sorted(
+            [(base_bits / r.bits_per_vec, r.ndcg10)
+             for r in results if r.group == group and r.bits_per_vec > 0],
+            key=lambda x: x[0])
         if not pts:
             continue
-        pts.sort(key=lambda x: x[0])
         xs, ys = zip(*pts)
-        ax1.plot(xs, ys, marker=marker, label=name, color=color,
-                 linewidth=1.5, markersize=7)
-        ax2.plot(xs, ys, marker=marker, label=name, color=color,
-                 linewidth=1.5, markersize=7)
+        for ax in (ax1, ax2):
+            ax.plot(xs, ys, marker=marker, label=name, color=color,
+                    linewidth=1.5, markersize=7)
 
     for ax in (ax1, ax2):
-        ax.axhline(baseline_ndcg, color="black", linestyle="--",
+        ax.axhline(base_ndcg, color="black", linestyle="--",
                    linewidth=1.2, label="float32 baseline")
         ax.set_xlabel("Compression ratio (vs float32)", fontsize=12)
         ax.set_ylabel("NDCG@10", fontsize=12)
         ax.legend(fontsize=8, loc="lower left")
         ax.grid(True, alpha=0.3)
 
-    ax1.set_title("Compression vs NDCG@10 (linear scale)", fontsize=13)
-    ax2.set_title("Compression vs NDCG@10 (log x scale)", fontsize=13)
+    ax1.set_title("TODO 4: Compression vs NDCG@10 (linear)", fontsize=12)
+    ax2.set_title("TODO 4: Compression vs NDCG@10 (log x)", fontsize=12)
     ax2.set_xscale("log")
 
-    fig.suptitle("Quantization scheme comparison on FEVER (BEIR)",
+    fig.suptitle("Embedding → Angles → Quantize: full tradeoff",
                  fontsize=14, fontweight="bold")
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"plot written to: {path}")
+    print(f"plot  -> {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -648,24 +517,14 @@ def plot_tradeoff(results: list[EvalResult], path: Path) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--embed-dir", required=True,
-                    help="Root of embedding output dir for one dataset "
-                         "(e.g. embeddings/fever). Must contain corpus/ and queries/ sub-dirs.")
-    ap.add_argument("--data-dir",  required=True,
-                    help="BEIR dataset directory (e.g. bier-data/fever). "
-                         "Used to load qrels.")
-    ap.add_argument("--embed-tag", default="",
-                    help="Chunk filename tag (e.g. 'minilm-l6-vllm'). "
-                         "Empty string means the plain OAI layout (no tag).")
-    ap.add_argument("--max-corpus",  type=int, default=50_000,
-                    help="Max corpus docs to load (default 50k, safe for t3.medium 4GB). "
-                         "Use 0 for no limit (requires ~33 GB for full FEVER).")
-    ap.add_argument("--max-queries", type=int, default=0,
-                    help="Max queries to evaluate (0 = all).")
-    ap.add_argument("--output-dir",  default="eval_results",
-                    help="Where to write table, CSV, and plot.")
-    ap.add_argument("--batch-q", type=int, default=256,
-                    help="Query batch size for scoring (reduce if OOM).")
+    ap.add_argument("--embed-dir",  required=True)
+    ap.add_argument("--data-dir",   required=True)
+    ap.add_argument("--embed-tag",  default="")
+    ap.add_argument("--max-corpus", type=int, default=50_000,
+                    help="Max corpus docs (default 50k, safe for 4 GB RAM). 0 = no limit.")
+    ap.add_argument("--max-queries", type=int, default=0)
+    ap.add_argument("--output-dir", default="eval_results")
+    ap.add_argument("--batch-q",    type=int, default=256)
     args = ap.parse_args()
 
     embed_dir = Path(args.embed_dir).expanduser().resolve()
@@ -673,46 +532,46 @@ def main():
     out_dir   = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    max_corpus = args.max_corpus if args.max_corpus > 0 else None
+    max_corpus  = args.max_corpus  or None
+    max_queries = args.max_queries or None
 
-    print(f"Loading corpus embeddings from {embed_dir / 'corpus'} ...")
-    c_vecs, c_ids = load_split(embed_dir / "corpus", args.embed_tag, max_corpus)
-    print(f"  loaded {c_vecs.shape[0]:,} corpus vectors  dim={c_vecs.shape[1]}")
+    print(f"Loading corpus  from {embed_dir / 'corpus'} ...")
+    c_vecs, c_ids = load_split(embed_dir / "corpus",  args.embed_tag, max_corpus)
+    print(f"  {c_vecs.shape[0]:,} docs  dim={c_vecs.shape[1]}")
 
-    print(f"Loading query embeddings from {embed_dir / 'queries'} ...")
-    q_max = args.max_queries if args.max_queries > 0 else None
-    q_vecs, q_ids = load_split(embed_dir / "queries", args.embed_tag, q_max)
-    print(f"  loaded {q_vecs.shape[0]:,} query vectors")
+    print(f"Loading queries from {embed_dir / 'queries'} ...")
+    q_vecs, q_ids = load_split(embed_dir / "queries", args.embed_tag, max_queries)
+    print(f"  {q_vecs.shape[0]:,} queries")
 
     print(f"Loading qrels from {data_dir} ...")
     all_qrels = load_qrels(data_dir)
 
-    # keep only queries whose relevant docs are in our corpus sample
     c_id_set = set(c_ids)
-    filtered_qids = [qid for qid in q_ids
-                     if qid in all_qrels and
-                     any(cid in c_id_set for cid in all_qrels[qid])]
-    print(f"  {len(filtered_qids):,} / {len(q_ids):,} queries have relevant docs in corpus sample")
-
-    if not filtered_qids:
-        print("ERROR: no queries have relevant docs in the loaded corpus sample. "
-              "Increase --max-corpus or check --embed-tag.")
+    filt_qids = [qid for qid in q_ids
+                 if qid in all_qrels and
+                 any(cid in c_id_set for cid in all_qrels[qid])]
+    print(f"  {len(filt_qids):,} / {len(q_ids):,} queries have relevant docs in corpus sample")
+    if not filt_qids:
+        print("ERROR: no queries with relevant docs in corpus sample. Increase --max-corpus.")
         return
 
-    # Reorder q_vecs to match filtered_qids
     qid_to_idx = {qid: i for i, qid in enumerate(q_ids)}
-    filt_idx   = [qid_to_idx[qid] for qid in filtered_qids]
-    q_vecs_f   = q_vecs[filt_idx]
-    qrels_f    = {qid: all_qrels[qid] for qid in filtered_qids}
+    q_vecs_f   = q_vecs[[qid_to_idx[qid] for qid in filt_qids]]
+    qrels_f    = {qid: all_qrels[qid] for qid in filt_qids}
 
-    print(f"\nRunning evaluation on {len(filtered_qids):,} queries x {len(c_ids):,} corpus docs")
-    print(f"Dim={c_vecs.shape[1]}  float32 baseline = {32 * c_vecs.shape[1]:,} bits/vec\n")
+    print(f"\nEvaluating {len(filt_qids):,} queries x {len(c_ids):,} corpus docs")
+    print(f"float32 baseline = {32 * c_vecs.shape[1]:,} bits/vec\n")
 
-    results = run_all(c_vecs, q_vecs_f, c_ids, filtered_qids, qrels_f, out_dir)
+    results, clipping = run_all(c_vecs, q_vecs_f, c_ids, filt_qids, qrels_f, args.batch_q)
+
+    base_ndcg = next(r.ndcg10 for r in results if "float32" in r.label)
 
     write_table(results, out_dir / "results_table.txt")
     write_csv(results,   out_dir / "results.csv")
-    plot_tradeoff(results, out_dir / "tradeoff.png")
+    plot_main(results,   out_dir / "plot_main.png")
+    if clipping:
+        plot_clipping(clipping, base_ndcg, out_dir / "plot_clipping.png")
+    plot_tradeoff(results, out_dir / "plot_tradeoff.png")
 
     print(f"\nAll outputs in: {out_dir}")
 
