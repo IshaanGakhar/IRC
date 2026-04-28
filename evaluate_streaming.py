@@ -15,10 +15,9 @@ Memory footprint (with --c-batch 30000, --q-batch 512):
 Resumability:
   Pass 1 (stats):  saves stats_partial.npz after each batch; promotes to
                    stats.npz when complete.
-  Pass 2 (score):  for each scheme, saves {scheme}/top_scores.npy,
-                   {scheme}/top_gidx.npy, and {scheme}/state.json after each
-                   corpus batch. Restart the script to resume from the last
-                   saved batch. Completed schemes (DONE marker) are skipped.
+  Pass 2 (score):  chunk-major loop; saves a single progress/scoring_state.npz
+                   (top_scores + top_gidx for *all* schemes stacked) every
+                   --checkpoint-every chunks. Restart the script to resume.
 
 Usage:
     python evaluate_streaming.py \\
@@ -112,29 +111,38 @@ def load_qrels(data_dir: Path) -> dict[str, dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 def to_angles(x: np.ndarray) -> np.ndarray:
+    """Cartesian -> (n-1) hyperspherical angles. Fully vectorised."""
     x    = x.astype(np.float32, copy=False)
     N, n = x.shape
-    out  = np.zeros((N, n - 1), dtype=np.float32)
-    sq   = x ** 2
-    tail = np.sqrt(np.clip(np.cumsum(sq[:, ::-1], axis=1)[:, ::-1], 0.0, None))
+    sq   = x * x
+    tail = np.sqrt(np.clip(np.cumsum(sq[:, ::-1], axis=1)[:, ::-1],
+                           0.0, None)).astype(np.float32, copy=False)
     del sq
-    for i in range(n - 2):
-        out[:, i] = np.arccos(np.clip(x[:, i] / np.clip(tail[:, i], 1e-7, None),
-                                      -1.0, 1.0))
-    last = np.arctan2(x[:, n - 1], x[:, n - 2])
-    out[:, n - 2] = np.where(last < 0, last + 2 * math.pi, last)
+    out = np.empty((N, n - 1), dtype=np.float32)
+    if n > 2:
+        out[:, : n - 2] = np.arccos(np.clip(
+            x[:, : n - 2] / np.clip(tail[:, : n - 2], 1e-7, None),
+            -1.0, 1.0))
+    last          = np.arctan2(x[:, n - 1], x[:, n - 2])
+    out[:, n - 2] = np.where(last < 0, last + np.float32(2 * math.pi), last)
     del tail, last
     return out
 
 
 def from_angles(a: np.ndarray) -> np.ndarray:
+    """Inverse of to_angles. Vectorised via cumprod-of-sin."""
+    a = a.astype(np.float32, copy=False)
     N, m = a.shape
-    x    = np.zeros((N, m + 1), dtype=np.float32)
-    sp   = np.ones(N, dtype=np.float32)
-    for i in range(m):
-        x[:, i] = sp * np.cos(a[:, i])
-        sp = sp * np.sin(a[:, i])
-    x[:, m] = sp
+    cosA = np.cos(a, dtype=np.float32)
+    sinA = np.sin(a, dtype=np.float32)
+    cum_sin = np.empty((N, m + 1), dtype=np.float32)
+    cum_sin[:, 0]  = 1.0
+    cum_sin[:, 1:] = np.cumprod(sinA, axis=1)
+    del sinA
+    x = np.empty((N, m + 1), dtype=np.float32)
+    x[:, :m] = cosA * cum_sin[:, :m]
+    x[:,  m] = cum_sin[:, m]
+    del cosA, cum_sin
     norms = np.linalg.norm(x, axis=1, keepdims=True)
     return x / np.clip(norms, 1e-7, None)
 
@@ -400,130 +408,138 @@ def update_topk(top_scores: np.ndarray, top_gidx: np.ndarray,
         del sims, comb_s, comb_g, sel
 
 
-def score_scheme(
-    scheme_name: str,
-    scheme_fn,
-    bits_per_vec: int,
-    corpus_chunks: list[Path],
-    q_vecs: np.ndarray,
-    q_ids: list[str],
-    all_doc_ids: list[str],    # flat list in chunk order
-    qrels: dict[str, dict[str, int]],
-    progress_dir: Path,
-    k: int = 100,
-    q_batch: int = 512,
-) -> dict:
-    """Score all corpus chunks for one scheme. Resumable."""
-    progress_dir.mkdir(parents=True, exist_ok=True)
-    done_marker  = progress_dir / "DONE"
-    state_path   = progress_dir / "state.json"
-    ts_path      = progress_dir / "top_scores.npy"
-    tg_path      = progress_dir / "top_gidx.npy"
-
-    n_q = len(q_ids)
-
-    if done_marker.exists():
-        print(f"  [{scheme_name}] already complete, loading saved results")
-        top_scores = np.load(ts_path)
-        top_gidx   = np.load(tg_path)
-        chunks_done = len(corpus_chunks)
-        global_offset = len(all_doc_ids)
-    elif state_path.exists():
-        st = json.loads(state_path.read_text())
-        chunks_done   = st["chunks_done"]
-        global_offset = st["global_offset"]
-        top_scores    = np.load(ts_path)
-        top_gidx      = np.load(tg_path)
-        print(f"  [{scheme_name}] resuming from chunk {chunks_done}  "
-              f"({global_offset:,} docs processed)")
-    else:
-        chunks_done   = 0
-        global_offset = 0
-        top_scores    = np.full((n_q, k), -np.inf, dtype=np.float32)
-        top_gidx      = np.zeros((n_q, k), dtype=np.int64)
-
-    t0 = time.perf_counter()
-    n_total = len(corpus_chunks)
-
-    for ci, chunk_path in enumerate(corpus_chunks):
-        if ci < chunks_done:
-            # We still need to advance global_offset -- read just the size
-            if global_offset == 0:   # first resume pass, recalculate offset
-                for prev_ci in range(ci + 1):
-                    s = np.load(corpus_chunks[prev_ci], mmap_mode="r").shape[0]
-                    global_offset += s
-            continue
-
-        c_batch, _ = load_chunk(chunk_path)
-        c_angles   = to_angles(c_batch)
-        c_quant    = scheme_fn(c_batch, c_angles)
-        del c_batch, c_angles
-        free_mem()
-
-        update_topk(top_scores, top_gidx, c_quant, q_vecs,
-                    global_offset, k, q_batch)
-        global_offset += c_quant.shape[0]
-        del c_quant
-        free_mem()
-
-        chunks_done = ci + 1
-        # Atomic save: write then rename (open file handle avoids np.save
-        # appending an extra .npy to paths that already end in .npy.tmp)
-        tmp_ts = ts_path.parent / (ts_path.name + ".tmp")
-        tmp_tg = tg_path.parent / (tg_path.name + ".tmp")
-        with tmp_ts.open("wb") as f: np.save(f, top_scores)
-        with tmp_tg.open("wb") as f: np.save(f, top_gidx)
-        os.replace(tmp_ts, ts_path)
-        os.replace(tmp_tg, tg_path)
-        state_path.write_text(json.dumps(
-            {"chunks_done": chunks_done, "global_offset": global_offset}))
-
-        elapsed = time.perf_counter() - t0
-        rate    = global_offset / elapsed
-        remain  = (len(all_doc_ids) - global_offset) / max(rate, 1)
-        print(f"  [{scheme_name}] {chunks_done}/{n_total}  "
-              f"{global_offset:,} docs  {rate:.0f} doc/s  "
-              f"ETA {remain/60:.0f}min", end="\r")
-
-    print()
-    done_marker.write_text("ok\n")
-
-    # Evaluate NDCG@10 and Recall@100 from top_gidx
-    # dtype=object stores Python string pointers (~43 MB) vs dtype=str which
-    # pads every string to max length and can exceed 4 GB on FEVER.
-    doc_id_arr = np.array(all_doc_ids, dtype=object)
+def _eval_metrics(top_scores: np.ndarray, top_gidx: np.ndarray,
+                  q_ids: list[str], doc_id_arr: np.ndarray,
+                  qrels: dict[str, dict[str, int]]) -> tuple[float, float, int]:
     ndcg_sc: list[float] = []
     rec_sc:  list[float] = []
-
     for qi, qid in enumerate(q_ids):
         rel = qrels.get(qid)
         if not rel:
             continue
-        # Sort top_gidx[qi] by top_scores[qi] descending
-        order  = np.argsort(-top_scores[qi])
+        order      = np.argsort(-top_scores[qi])
         ranked_idx = top_gidx[qi][order]
         ranked_ids = doc_id_arr[ranked_idx]
-
         rels  = [rel.get(did, 0) for did in ranked_ids[:10]]
         ideal = sorted(rel.values(), reverse=True)
         idcg  = sum(r / math.log2(i + 2) for i, r in enumerate(ideal[:10]))
         ndcg  = sum(r / math.log2(i + 2) for i, r in enumerate(rels)) / idcg \
                 if idcg else 0.0
         ndcg_sc.append(ndcg)
-
         hits = sum(1 for did in ranked_ids[:100] if did in rel)
         rec_sc.append(hits / len(rel))
+    return (float(np.mean(ndcg_sc)) if ndcg_sc else 0.0,
+            float(np.mean(rec_sc))   if rec_sc  else 0.0,
+            len(ndcg_sc))
 
-    elapsed = time.perf_counter() - t0
-    return {
-        "scheme":       scheme_name,
-        "bits_per_vec": bits_per_vec,
-        "ndcg10":       float(np.mean(ndcg_sc))  if ndcg_sc else 0.0,
-        "recall100":    float(np.mean(rec_sc))    if rec_sc  else 0.0,
-        "n_queries":    len(ndcg_sc),
-        "n_corpus":     global_offset,
-        "elapsed_s":    elapsed,
-    }
+
+def score_all_schemes(
+    schemes: list[tuple[str, object, int]],
+    corpus_chunks: list[Path],
+    q_vecs: np.ndarray,
+    q_ids: list[str],
+    all_doc_ids: list[str],
+    qrels: dict[str, dict[str, int]],
+    progress_dir: Path,
+    k: int = 100,
+    q_batch: int = 8192,
+    checkpoint_every: int = 50,
+) -> list[dict]:
+    """Chunk-major scoring: load each chunk once, run all schemes against it.
+
+    State is one .npz containing top_scores/top_gidx for every scheme stacked.
+    Restart the script to resume from the last checkpoint.
+    """
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    state_path = progress_dir / "scoring_state.npz"
+    n_schemes  = len(schemes)
+    n_q        = len(q_ids)
+    scheme_names = [s[0] for s in schemes]
+
+    if state_path.exists():
+        d = np.load(state_path, allow_pickle=True)
+        saved_names = list(d["scheme_names"])
+        if saved_names != scheme_names:
+            raise ValueError(
+                f"Scheme list changed since checkpoint.\n"
+                f"  saved:   {saved_names}\n  current: {scheme_names}\n"
+                f"Delete {state_path} and restart, or pass --schemes to match.")
+        top_scores    = d["top_scores"].astype(np.float32, copy=False)
+        top_gidx      = d["top_gidx"].astype(np.int64, copy=False)
+        chunks_done   = int(d["chunks_done"])
+        global_offset = int(d["global_offset"])
+        print(f"  resuming from chunk {chunks_done}/{len(corpus_chunks)}  "
+              f"({global_offset:,} docs processed)")
+    else:
+        top_scores    = np.full((n_schemes, n_q, k), -np.inf, dtype=np.float32)
+        top_gidx      = np.zeros((n_schemes, n_q, k), dtype=np.int64)
+        chunks_done   = 0
+        global_offset = 0
+
+    n_total       = len(corpus_chunks)
+    t0            = time.perf_counter()
+    docs_at_start = global_offset
+    last_print    = 0.0
+
+    for ci, chunk_path in enumerate(corpus_chunks):
+        if ci < chunks_done:
+            continue
+
+        c_batch, _ = load_chunk(chunk_path)
+        c_angles   = to_angles(c_batch)
+        bsize      = c_batch.shape[0]
+
+        for si, (_sname, sfn, _bits) in enumerate(schemes):
+            c_quant = sfn(c_batch, c_angles)
+            update_topk(top_scores[si], top_gidx[si], c_quant, q_vecs,
+                        global_offset, k, q_batch)
+            del c_quant
+
+        global_offset += bsize
+        chunks_done    = ci + 1
+        del c_batch, c_angles
+        free_mem()
+
+        if chunks_done % checkpoint_every == 0 or chunks_done == n_total:
+            tmp = state_path.parent / (state_path.name + ".tmp")
+            with tmp.open("wb") as f:
+                np.savez(f,
+                         top_scores=top_scores, top_gidx=top_gidx,
+                         chunks_done=np.int64(chunks_done),
+                         global_offset=np.int64(global_offset),
+                         scheme_names=np.array(scheme_names, dtype=object))
+            os.replace(tmp, state_path)
+
+        now = time.perf_counter()
+        if now - last_print > 5 or chunks_done == n_total:
+            elapsed = now - t0
+            done    = global_offset - docs_at_start
+            rate    = done / max(elapsed, 1e-3)
+            remain  = (len(all_doc_ids) - global_offset) / max(rate, 1)
+            print(f"  chunk {chunks_done}/{n_total}  "
+                  f"{global_offset:,} docs  {n_schemes} schemes  "
+                  f"{rate:.0f} doc/s  ETA {remain/60:.1f}min   ",
+                  end="\r", flush=True)
+            last_print = now
+
+    print()
+
+    doc_id_arr = np.array(all_doc_ids, dtype=object)
+    results: list[dict] = []
+    elapsed_total = time.perf_counter() - t0
+    for si, (sname, _sfn, bits) in enumerate(schemes):
+        ndcg, rec, nq = _eval_metrics(top_scores[si], top_gidx[si],
+                                      q_ids, doc_id_arr, qrels)
+        results.append({
+            "scheme":       sname,
+            "bits_per_vec": bits,
+            "ndcg10":       ndcg,
+            "recall100":    rec,
+            "n_queries":    nq,
+            "n_corpus":     global_offset,
+            "elapsed_s":    elapsed_total,
+        })
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -571,11 +587,13 @@ def main():
                     help='Chunk filename tag ("" for plain OAI layout).')
     ap.add_argument("--output-dir", default="eval_results_full")
     ap.add_argument("--c-batch",    type=int, default=30_000,
-                    help="Corpus docs per batch (default 30k).")
-    ap.add_argument("--q-batch",    type=int, default=512,
-                    help="Query batch size for scoring (default 512).")
+                    help="(reserved) target corpus docs per batch.")
+    ap.add_argument("--q-batch",    type=int, default=8192,
+                    help="Query batch size for scoring matmul (default 8192).")
     ap.add_argument("--k",          type=int, default=100,
                     help="Top-k to accumulate (default 100).")
+    ap.add_argument("--checkpoint-every", type=int, default=50,
+                    help="Save scoring state every N chunks (default 50).")
     ap.add_argument("--schemes",    nargs="*", default=None,
                     help="Scheme names to run (default: all). "
                          "Use --list-schemes to see names.")
@@ -652,29 +670,28 @@ def main():
     print(f"\n=== Pass 2: scoring {len(schemes)} schemes "
           f"against {len(all_doc_ids):,} docs ===")
     print(f"  float32 baseline = {base_bits:,} bits/vec")
-    print(f"  corpus batches   = {len(corpus_chunks)}\n")
+    print(f"  corpus chunks    = {len(corpus_chunks)}")
+    print(f"  q-batch={args.q_batch}  checkpoint every {args.checkpoint_every} chunks\n")
 
-    results: list[dict] = []
-    for scheme_name, scheme_fn, bits in schemes:
-        print(f"\n--- scheme: {scheme_name}  ({bits}b/vec, "
-              f"{base_bits/bits:.1f}x compression) ---")
-        r = score_scheme(
-            scheme_name  = scheme_name,
-            scheme_fn    = scheme_fn,
-            bits_per_vec = bits,
-            corpus_chunks= corpus_chunks,
-            q_vecs       = q_filt,
-            q_ids        = q_with_qrels,
-            all_doc_ids  = all_doc_ids,
-            qrels        = qrels_f,
-            progress_dir = progress_root / scheme_name,
-            k            = args.k,
-            q_batch      = args.q_batch,
-        )
-        results.append(r)
-        print(f"  NDCG@10={r['ndcg10']:.4f}  "
-              f"R@100={r['recall100']:.4f}  "
-              f"{r['elapsed_s']:.0f}s")
+    # Friendly notice about leftover per-scheme dirs from the old layout.
+    legacy = [p for p in progress_root.iterdir()
+              if p.is_dir() and ((p / "state.json").exists() or (p / "DONE").exists())]
+    if legacy:
+        print(f"  [info] ignoring {len(legacy)} stale per-scheme progress dirs "
+              f"(old layout). Safe to delete: {progress_root}/{{{','.join(p.name for p in legacy[:3])}{',...' if len(legacy)>3 else ''}}}\n")
+
+    results = score_all_schemes(
+        schemes         = schemes,
+        corpus_chunks   = corpus_chunks,
+        q_vecs          = q_filt,
+        q_ids           = q_with_qrels,
+        all_doc_ids     = all_doc_ids,
+        qrels           = qrels_f,
+        progress_dir    = progress_root,
+        k               = args.k,
+        q_batch         = args.q_batch,
+        checkpoint_every= args.checkpoint_every,
+    )
 
     write_results(results, base_bits, out_dir / "results_streaming.txt")
     print(f"\nDone. All outputs in: {out_dir}")
