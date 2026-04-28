@@ -385,27 +385,35 @@ def update_topk(top_scores: np.ndarray, top_gidx: np.ndarray,
                 c_quant: np.ndarray, q_vecs: np.ndarray,
                 gidx_start: int, k: int, q_batch: int) -> None:
     """In-place update of (top_scores, top_gidx) with scores against c_quant.
-    Queries are batched to keep the score matrix small."""
+    Memory-light: avoids materialising a (q_batch, B) int64 broadcast for new
+    indices; resolves new vs existing positions only after argpartition."""
     n_q        = q_vecs.shape[0]
     batch_size = c_quant.shape[0]
-    new_gidx   = np.arange(gidx_start, gidx_start + batch_size, dtype=np.int64)
+    c_quant_T  = np.ascontiguousarray(c_quant.T)            # (D, B), one-time
 
     for qs in range(0, n_q, q_batch):
         qe     = min(qs + q_batch, n_q)
-        sims   = q_vecs[qs:qe] @ c_quant.T                         # (qb, B)
+        sims   = q_vecs[qs:qe] @ c_quant_T                  # (qb, B)
 
-        comb_s = np.concatenate([top_scores[qs:qe], sims], axis=1) # (qb, k+B)
-        comb_g = np.concatenate(
-            [top_gidx[qs:qe],
-             np.broadcast_to(new_gidx, (qe - qs, batch_size)).copy()],
-            axis=1)                                                 # (qb, k+B)
+        comb_s = np.concatenate([top_scores[qs:qe], sims], axis=1)  # (qb, k+B)
+        del sims
 
-        kth    = min(k, comb_s.shape[1] - 1)
-        sel    = np.argpartition(-comb_s, kth=kth, axis=1)[:, :k]
+        kth = min(k, comb_s.shape[1] - 1)
+        sel = np.argpartition(-comb_s, kth=kth, axis=1)[:, :k]      # (qb, k)
 
         top_scores[qs:qe] = np.take_along_axis(comb_s, sel, axis=1)
-        top_gidx[qs:qe]   = np.take_along_axis(comb_g, sel, axis=1)
-        del sims, comb_s, comb_g, sel
+        del comb_s
+
+        # Resolve gidx without materialising a (qb, B) broadcast:
+        # sel < k -> existing top_gidx[qs:qe, sel]
+        # sel >= k -> new global idx = gidx_start + (sel - k)
+        from_new   = sel >= k
+        safe_old   = np.where(from_new, 0, sel)
+        safe_offs  = np.where(from_new, sel - k, 0)
+        old_picked = np.take_along_axis(top_gidx[qs:qe], safe_old, axis=1)
+        new_picked = (gidx_start + safe_offs).astype(np.int64, copy=False)
+        top_gidx[qs:qe] = np.where(from_new, new_picked, old_picked)
+        del sel, from_new, safe_old, safe_offs, old_picked, new_picked
 
 
 def _eval_metrics(top_scores: np.ndarray, top_gidx: np.ndarray,
@@ -433,6 +441,24 @@ def _eval_metrics(top_scores: np.ndarray, top_gidx: np.ndarray,
             len(ndcg_sc))
 
 
+def _build_super_batches(corpus_chunks: list[Path],
+                         target_docs: int) -> list[tuple[list[Path], int]]:
+    """Group consecutive chunks into super-batches summing to ~target_docs.
+    Reads only the .npy header (mmap_mode='r') for sizes — no data load."""
+    groups: list[tuple[list[Path], int]] = []
+    cur, cur_n = [], 0
+    for cp in corpus_chunks:
+        s = np.load(cp, mmap_mode="r").shape[0]
+        cur.append(cp)
+        cur_n += s
+        if cur_n >= target_docs:
+            groups.append((cur, cur_n))
+            cur, cur_n = [], 0
+    if cur:
+        groups.append((cur, cur_n))
+    return groups
+
+
 def score_all_schemes(
     schemes: list[tuple[str, object, int]],
     corpus_chunks: list[Path],
@@ -444,11 +470,14 @@ def score_all_schemes(
     k: int = 100,
     q_batch: int = 8192,
     checkpoint_every: int = 50,
+    super_batch_docs: int = 50_000,
 ) -> list[dict]:
-    """Chunk-major scoring: load each chunk once, run all schemes against it.
+    """Chunk-major scoring with super-batching for BLAS efficiency.
 
-    State is one .npz containing top_scores/top_gidx for every scheme stacked.
-    Restart the script to resume from the last checkpoint.
+    Many small disk chunks are concatenated into a single ~super_batch_docs-row
+    matrix before scoring, so each (n_q, D) @ (D, B) matmul is large enough to
+    saturate multi-core BLAS. All schemes run against the same super-batch in
+    one pass (angles computed once).
     """
     progress_dir.mkdir(parents=True, exist_ok=True)
     state_path = progress_dir / "scoring_state.npz"
@@ -456,38 +485,55 @@ def score_all_schemes(
     n_q        = len(q_ids)
     scheme_names = [s[0] for s in schemes]
 
+    print(f"  building super-batches (~{super_batch_docs:,} docs each) ...",
+          flush=True)
+    super_batches = _build_super_batches(corpus_chunks, super_batch_docs)
+    n_groups      = len(super_batches)
+    print(f"  {n_groups} super-batches from {len(corpus_chunks)} chunks", flush=True)
+
     if state_path.exists():
         d = np.load(state_path, allow_pickle=True)
         saved_names = list(d["scheme_names"])
+        saved_sb    = int(d["super_batch_docs"]) if "super_batch_docs" in d.files else -1
         if saved_names != scheme_names:
             raise ValueError(
                 f"Scheme list changed since checkpoint.\n"
                 f"  saved:   {saved_names}\n  current: {scheme_names}\n"
                 f"Delete {state_path} and restart, or pass --schemes to match.")
+        if saved_sb != super_batch_docs:
+            raise ValueError(
+                f"--super-batch changed ({saved_sb} -> {super_batch_docs}). "
+                f"Delete {state_path} and restart, or rerun with the original "
+                f"value.")
         top_scores    = d["top_scores"].astype(np.float32, copy=False)
         top_gidx      = d["top_gidx"].astype(np.int64, copy=False)
-        chunks_done   = int(d["chunks_done"])
+        groups_done   = int(d["groups_done"])
         global_offset = int(d["global_offset"])
-        print(f"  resuming from chunk {chunks_done}/{len(corpus_chunks)}  "
+        print(f"  resuming from super-batch {groups_done}/{n_groups}  "
               f"({global_offset:,} docs processed)")
     else:
         top_scores    = np.full((n_schemes, n_q, k), -np.inf, dtype=np.float32)
         top_gidx      = np.zeros((n_schemes, n_q, k), dtype=np.int64)
-        chunks_done   = 0
+        groups_done   = 0
         global_offset = 0
 
-    n_total       = len(corpus_chunks)
     t0            = time.perf_counter()
     docs_at_start = global_offset
     last_print    = 0.0
 
-    for ci, chunk_path in enumerate(corpus_chunks):
-        if ci < chunks_done:
+    for gi, (group_paths, group_size) in enumerate(super_batches):
+        if gi < groups_done:
             continue
 
-        c_batch, _ = load_chunk(chunk_path)
-        c_angles   = to_angles(c_batch)
-        bsize      = c_batch.shape[0]
+        # Load + concatenate this super-batch
+        if len(group_paths) == 1:
+            c_batch, _ = load_chunk(group_paths[0])
+        else:
+            arrs = [load_chunk(p)[0] for p in group_paths]
+            c_batch = np.concatenate(arrs, axis=0).astype(np.float32, copy=False)
+            del arrs
+        c_angles = to_angles(c_batch)
+        bsize    = c_batch.shape[0]
 
         for si, (_sname, sfn, _bits) in enumerate(schemes):
             c_quant = sfn(c_batch, c_angles)
@@ -496,27 +542,28 @@ def score_all_schemes(
             del c_quant
 
         global_offset += bsize
-        chunks_done    = ci + 1
+        groups_done    = gi + 1
         del c_batch, c_angles
         free_mem()
 
-        if chunks_done % checkpoint_every == 0 or chunks_done == n_total:
+        if groups_done % checkpoint_every == 0 or groups_done == n_groups:
             tmp = state_path.parent / (state_path.name + ".tmp")
             with tmp.open("wb") as f:
                 np.savez(f,
                          top_scores=top_scores, top_gidx=top_gidx,
-                         chunks_done=np.int64(chunks_done),
+                         groups_done=np.int64(groups_done),
                          global_offset=np.int64(global_offset),
+                         super_batch_docs=np.int64(super_batch_docs),
                          scheme_names=np.array(scheme_names, dtype=object))
             os.replace(tmp, state_path)
 
         now = time.perf_counter()
-        if now - last_print > 5 or chunks_done == n_total:
+        if now - last_print > 5 or groups_done == n_groups:
             elapsed = now - t0
             done    = global_offset - docs_at_start
             rate    = done / max(elapsed, 1e-3)
             remain  = (len(all_doc_ids) - global_offset) / max(rate, 1)
-            print(f"  chunk {chunks_done}/{n_total}  "
+            print(f"  super-batch {groups_done}/{n_groups}  "
                   f"{global_offset:,} docs  {n_schemes} schemes  "
                   f"{rate:.0f} doc/s  ETA {remain/60:.1f}min   ",
                   end="\r", flush=True)
@@ -586,14 +633,17 @@ def main():
     ap.add_argument("--embed-tag",  default="",
                     help='Chunk filename tag ("" for plain OAI layout).')
     ap.add_argument("--output-dir", default="eval_results_full")
-    ap.add_argument("--c-batch",    type=int, default=30_000,
-                    help="(reserved) target corpus docs per batch.")
+    ap.add_argument("--super-batch", type=int, default=50_000,
+                    help="Concatenate consecutive disk chunks until reaching "
+                         "~N docs, then score that whole block in one BLAS "
+                         "matmul. Bigger = faster on multi-core boxes, more "
+                         "RAM. Default 50k (good for 96-core c5a.24xlarge).")
     ap.add_argument("--q-batch",    type=int, default=8192,
                     help="Query batch size for scoring matmul (default 8192).")
     ap.add_argument("--k",          type=int, default=100,
                     help="Top-k to accumulate (default 100).")
-    ap.add_argument("--checkpoint-every", type=int, default=50,
-                    help="Save scoring state every N chunks (default 50).")
+    ap.add_argument("--checkpoint-every", type=int, default=10,
+                    help="Save scoring state every N super-batches (default 10).")
     ap.add_argument("--schemes",    nargs="*", default=None,
                     help="Scheme names to run (default: all). "
                          "Use --list-schemes to see names.")
@@ -671,7 +721,8 @@ def main():
           f"against {len(all_doc_ids):,} docs ===")
     print(f"  float32 baseline = {base_bits:,} bits/vec")
     print(f"  corpus chunks    = {len(corpus_chunks)}")
-    print(f"  q-batch={args.q_batch}  checkpoint every {args.checkpoint_every} chunks\n")
+    print(f"  super-batch={args.super_batch:,}  q-batch={args.q_batch}  "
+          f"checkpoint every {args.checkpoint_every} super-batches\n")
 
     # Friendly notice about leftover per-scheme dirs from the old layout.
     legacy = [p for p in progress_root.iterdir()
@@ -681,16 +732,17 @@ def main():
               f"(old layout). Safe to delete: {progress_root}/{{{','.join(p.name for p in legacy[:3])}{',...' if len(legacy)>3 else ''}}}\n")
 
     results = score_all_schemes(
-        schemes         = schemes,
-        corpus_chunks   = corpus_chunks,
-        q_vecs          = q_filt,
-        q_ids           = q_with_qrels,
-        all_doc_ids     = all_doc_ids,
-        qrels           = qrels_f,
-        progress_dir    = progress_root,
-        k               = args.k,
-        q_batch         = args.q_batch,
-        checkpoint_every= args.checkpoint_every,
+        schemes          = schemes,
+        corpus_chunks    = corpus_chunks,
+        q_vecs           = q_filt,
+        q_ids            = q_with_qrels,
+        all_doc_ids      = all_doc_ids,
+        qrels            = qrels_f,
+        progress_dir     = progress_root,
+        k                = args.k,
+        q_batch          = args.q_batch,
+        checkpoint_every = args.checkpoint_every,
+        super_batch_docs = args.super_batch,
     )
 
     write_results(results, base_bits, out_dir / "results_streaming.txt")
