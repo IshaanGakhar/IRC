@@ -44,6 +44,29 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
+# BLAS thread control (must run before heavy numpy work)
+# ---------------------------------------------------------------------------
+
+def configure_blas(n_threads: int | None = None) -> None:
+    """Force the underlying BLAS lib (OpenBLAS / MKL / Accelerate / BLIS) to
+    use n_threads. Default = os.cpu_count(). Reports detected libraries.
+    Requires `pip install threadpoolctl`."""
+    try:
+        from threadpoolctl import threadpool_info, threadpool_limits
+    except ImportError:
+        print("  [blas] threadpoolctl not installed; BLAS may be single-threaded. "
+              "Run: pip install threadpoolctl", flush=True)
+        return
+    target = n_threads or os.cpu_count() or 1
+    info_before = threadpool_info()
+    threadpool_limits(limits=target)
+    info_after = threadpool_info()
+    for b, a in zip(info_before, info_after):
+        print(f"  [blas] {a.get('user_api','?'):>8} via {a.get('prefix','?'):<10} "
+              f"{b['num_threads']} -> {a['num_threads']} threads", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Memory management
 # ---------------------------------------------------------------------------
 
@@ -385,35 +408,53 @@ def update_topk(top_scores: np.ndarray, top_gidx: np.ndarray,
                 c_quant: np.ndarray, q_vecs: np.ndarray,
                 gidx_start: int, k: int, q_batch: int) -> None:
     """In-place update of (top_scores, top_gidx) with scores against c_quant.
-    Memory-light: avoids materialising a (q_batch, B) int64 broadcast for new
-    indices; resolves new vs existing positions only after argpartition."""
+
+    Two-stage merge to keep the working set tiny:
+      1. matmul -> sims (qb, B), then immediately argpartition down to local-k.
+      2. merge the (qb, k) local result with the running (qb, k) state via a
+         single argpartition on (qb, 2k).
+    This avoids ever allocating a (qb, k+B) or (qb, B) int64 array and lets the
+    big sims buffer be freed before the merge step.
+    """
     n_q        = q_vecs.shape[0]
     batch_size = c_quant.shape[0]
-    c_quant_T  = np.ascontiguousarray(c_quant.T)            # (D, B), one-time
+    c_quant_T  = np.ascontiguousarray(c_quant.T)             # (D, B)
+
+    if batch_size <= k:
+        # Whole batch fits in top-k, no argpartition needed for stage 1
+        new_gidx_full = (gidx_start +
+                         np.arange(batch_size, dtype=np.int64))   # (B,)
+        for qs in range(0, n_q, q_batch):
+            qe   = min(qs + q_batch, n_q)
+            sims = q_vecs[qs:qe] @ c_quant_T                      # (qb, B)
+            local_g = np.broadcast_to(new_gidx_full,
+                                      (qe - qs, batch_size))
+            merged_s = np.concatenate([top_scores[qs:qe], sims], axis=1)
+            merged_g = np.concatenate([top_gidx[qs:qe], local_g], axis=1)
+            sel = np.argpartition(-merged_s, kth=k - 1, axis=1)[:, :k]
+            top_scores[qs:qe] = np.take_along_axis(merged_s, sel, axis=1)
+            top_gidx[qs:qe]   = np.take_along_axis(merged_g, sel, axis=1)
+        return
 
     for qs in range(0, n_q, q_batch):
-        qe     = min(qs + q_batch, n_q)
-        sims   = q_vecs[qs:qe] @ c_quant_T                  # (qb, B)
+        qe = min(qs + q_batch, n_q)
 
-        comb_s = np.concatenate([top_scores[qs:qe], sims], axis=1)  # (qb, k+B)
-        del sims
+        # Stage 1: matmul + local top-k
+        sims      = q_vecs[qs:qe] @ c_quant_T                     # (qb, B) f32
+        local_sel = np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]   # (qb, k)
+        local_s   = np.take_along_axis(sims, local_sel, axis=1)        # (qb, k)
+        del sims                                                       # free B-sized buf
+        local_g   = (gidx_start + local_sel).astype(np.int64, copy=False)
+        del local_sel
 
-        kth = min(k, comb_s.shape[1] - 1)
-        sel = np.argpartition(-comb_s, kth=kth, axis=1)[:, :k]      # (qb, k)
-
-        top_scores[qs:qe] = np.take_along_axis(comb_s, sel, axis=1)
-        del comb_s
-
-        # Resolve gidx without materialising a (qb, B) broadcast:
-        # sel < k -> existing top_gidx[qs:qe, sel]
-        # sel >= k -> new global idx = gidx_start + (sel - k)
-        from_new   = sel >= k
-        safe_old   = np.where(from_new, 0, sel)
-        safe_offs  = np.where(from_new, sel - k, 0)
-        old_picked = np.take_along_axis(top_gidx[qs:qe], safe_old, axis=1)
-        new_picked = (gidx_start + safe_offs).astype(np.int64, copy=False)
-        top_gidx[qs:qe] = np.where(from_new, new_picked, old_picked)
-        del sel, from_new, safe_old, safe_offs, old_picked, new_picked
+        # Stage 2: merge running (qb, k) state with local (qb, k) -> (qb, 2k)
+        merged_s = np.concatenate([top_scores[qs:qe], local_s], axis=1)  # (qb, 2k)
+        merged_g = np.concatenate([top_gidx[qs:qe], local_g], axis=1)
+        del local_s, local_g
+        sel = np.argpartition(-merged_s, kth=k - 1, axis=1)[:, :k]
+        top_scores[qs:qe] = np.take_along_axis(merged_s, sel, axis=1)
+        top_gidx[qs:qe]   = np.take_along_axis(merged_g, sel, axis=1)
+        del merged_s, merged_g, sel
 
 
 def _eval_metrics(top_scores: np.ndarray, top_gidx: np.ndarray,
@@ -471,6 +512,7 @@ def score_all_schemes(
     q_batch: int = 8192,
     checkpoint_every: int = 50,
     super_batch_docs: int = 50_000,
+    scheme_workers: int = 1,
 ) -> list[dict]:
     """Chunk-major scoring with super-batching for BLAS efficiency.
 
@@ -521,25 +563,66 @@ def score_all_schemes(
     docs_at_start = global_offset
     last_print    = 0.0
 
+    # Optional thread pool for running schemes concurrently within a super-batch.
+    # Each worker calls scheme_fn (Python/numpy) and update_topk (BLAS matmul +
+    # argpartition). top_scores[si] / top_gidx[si] slices are disjoint per
+    # scheme, so concurrent writes are race-free.
+    executor = None
+    if scheme_workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=scheme_workers,
+                                      thread_name_prefix="scheme")
+        print(f"  scheme parallelism: {scheme_workers} workers", flush=True)
+
+    profile_first = True
     for gi, (group_paths, group_size) in enumerate(super_batches):
         if gi < groups_done:
             continue
 
+        prof = profile_first
+        t_load = t_ang = t_score = 0.0
+
         # Load + concatenate this super-batch
+        ts = time.perf_counter()
         if len(group_paths) == 1:
             c_batch, _ = load_chunk(group_paths[0])
         else:
             arrs = [load_chunk(p)[0] for p in group_paths]
             c_batch = np.concatenate(arrs, axis=0).astype(np.float32, copy=False)
             del arrs
+        if prof: t_load = time.perf_counter() - ts
+
+        ts = time.perf_counter()
         c_angles = to_angles(c_batch)
+        if prof: t_ang = time.perf_counter() - ts
         bsize    = c_batch.shape[0]
 
-        for si, (_sname, sfn, _bits) in enumerate(schemes):
+        def _run_scheme(si_fn):
+            si, sfn = si_fn
             c_quant = sfn(c_batch, c_angles)
             update_topk(top_scores[si], top_gidx[si], c_quant, q_vecs,
                         global_offset, k, q_batch)
-            del c_quant
+
+        ts = time.perf_counter()
+        tasks = [(si, sfn) for si, (_n, sfn, _b) in enumerate(schemes)]
+        if executor is not None:
+            list(executor.map(_run_scheme, tasks))
+        else:
+            for t in tasks:
+                _run_scheme(t)
+        if prof: t_score = time.perf_counter() - ts
+
+        if prof:
+            mode = (f"{scheme_workers}-way parallel"
+                    if executor is not None else "sequential")
+            print(f"  [profile sb #1, {bsize:,} docs, {len(schemes)} schemes, {mode}]\n"
+                  f"    load        = {t_load*1000:>7.0f} ms\n"
+                  f"    to_angles   = {t_ang*1000:>7.0f} ms\n"
+                  f"    all schemes = {t_score*1000:>7.0f} ms  "
+                  f"(wall avg {t_score/len(schemes)*1000:.0f} ms/scheme)\n"
+                  f"    total       = {(t_load+t_ang+t_score)*1000:>7.0f} ms",
+                  flush=True)
+            profile_first = False
 
         global_offset += bsize
         groups_done    = gi + 1
@@ -570,6 +653,9 @@ def score_all_schemes(
             last_print = now
 
     print()
+
+    if executor is not None:
+        executor.shutdown(wait=True)
 
     doc_id_arr = np.array(all_doc_ids, dtype=object)
     results: list[dict] = []
@@ -638,18 +724,46 @@ def main():
                          "~N docs, then score that whole block in one BLAS "
                          "matmul. Bigger = faster on multi-core boxes, more "
                          "RAM. Default 50k (good for 96-core c5a.24xlarge).")
-    ap.add_argument("--q-batch",    type=int, default=8192,
-                    help="Query batch size for scoring matmul (default 8192).")
+    ap.add_argument("--q-batch",    type=int, default=1024,
+                    help="Query batch size for scoring matmul (default 1024). "
+                         "Smaller = better cache locality for argpartition; "
+                         "larger = bigger BLAS calls.")
     ap.add_argument("--k",          type=int, default=100,
                     help="Top-k to accumulate (default 100).")
     ap.add_argument("--checkpoint-every", type=int, default=10,
                     help="Save scoring state every N super-batches (default 10).")
+    ap.add_argument("--blas-threads", type=int, default=0,
+                    help="Force BLAS thread count per call (0 = auto: "
+                         "cpu_count // scheme_workers).")
+    ap.add_argument("--scheme-workers", type=int, default=0,
+                    help="Run N schemes concurrently per super-batch "
+                         "(0 = auto, 1 = sequential). Each worker gets its "
+                         "own argpartition / from_angles thread; BLAS threads "
+                         "are split across workers to avoid oversubscription.")
     ap.add_argument("--schemes",    nargs="*", default=None,
                     help="Scheme names to run (default: all). "
                          "Use --list-schemes to see names.")
     ap.add_argument("--list-schemes", action="store_true",
                     help="Print all scheme names and exit.")
     args = ap.parse_args()
+
+    n_cpu = os.cpu_count() or 1
+    if args.scheme_workers == 0:
+        # Auto: aim for ~12 BLAS threads per worker (good matmul efficiency
+        # on c5a-class boxes). Capped by cpu_count and by 8 workers.
+        scheme_workers = max(1, min(8, n_cpu // 12))
+    else:
+        scheme_workers = args.scheme_workers
+
+    if args.blas_threads:
+        blas_threads = args.blas_threads
+    else:
+        blas_threads = max(1, n_cpu // scheme_workers)
+
+    print(f"Configuring BLAS: {blas_threads} threads/call  "
+          f"({scheme_workers} scheme workers x {blas_threads} = "
+          f"{scheme_workers * blas_threads} of {n_cpu} cores)")
+    configure_blas(blas_threads)
 
     embed_dir  = Path(args.embed_dir).expanduser().resolve()
     data_dir   = Path(args.data_dir).expanduser().resolve()
@@ -743,6 +857,7 @@ def main():
         q_batch          = args.q_batch,
         checkpoint_every = args.checkpoint_every,
         super_batch_docs = args.super_batch,
+        scheme_workers   = scheme_workers,
     )
 
     write_results(results, base_bits, out_dir / "results_streaming.txt")
