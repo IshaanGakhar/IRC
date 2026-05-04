@@ -289,6 +289,26 @@ def make_schemes(stats: dict, dim: int) -> list[tuple[str, object, int]]:
             out[:, _idx] = _uquant(a[:, _idx], keep_bits, hi[_idx])
         return from_angles(out)
 
+    def cart_clip(c, a, keep_d, bits):
+        """Vanilla Matryoshka-style truncation in Cartesian space:
+        keep the first `keep_d` coordinates (optionally int-`bits`
+        quantised), zero the rest, re-normalise to the unit sphere."""
+        N, D = c.shape
+        out  = np.zeros((N, D), dtype=np.float32)
+        if keep_d > 0:
+            head = c[:, :keep_d]
+            if bits >= 32:
+                out[:, :keep_d] = head
+            else:
+                levels = 1 << bits
+                scale  = (levels - 1) / 2.0
+                q      = np.clip(np.round(np.clip(head, -1.0, 1.0) * scale
+                                          + scale / 2),
+                                 0, levels - 1).astype(np.int32)
+                out[:, :keep_d] = (q.astype(np.float32) + 0.5) / scale - 1.0
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        return out / np.clip(norms, 1e-7, None)
+
     TIER_BITS = [0, 2, 4, 8, 16, 32]
     TIER_DIST = {
         0:  lambda r: r**2 / 12,
@@ -374,6 +394,28 @@ def make_schemes(stats: dict, dim: int) -> list[tuple[str, object, int]]:
         name   = f"pos_clip_{int(frac*100)}pct"
         schemes.append((name,
                         (lambda k_: lambda c, a: ang_clip(c, a, k_, 8))(keep_n),
+                        bits))
+
+    # Vanilla Cartesian truncation (Matryoshka-style):
+    #   keep first (1-frac)*D coords, int8-quantised, zero the rest, renorm.
+    #   Bit budget matches pos_clip_{frac} exactly: keep_d * 8 bits.
+    for frac in (0.0, 0.2, 0.4, 0.5, 0.6, 0.8):
+        keep_d = int(round(dim * (1.0 - frac)))
+        bits   = keep_d * 8
+        name   = f"cart_clip_{int(frac*100)}pct"
+        schemes.append((name,
+                        (lambda k_: lambda c, a: cart_clip(c, a, k_, 8))(keep_d),
+                        bits))
+
+    # Pure float32 Matryoshka slice (no quantisation, just truncate+renorm).
+    #   Budget = keep_d * 32 bits.  Useful to separate "truncation hurt"
+    #   from "quantisation hurt".
+    for frac in (0.2, 0.4, 0.5, 0.6, 0.8):
+        keep_d = int(round(dim * (1.0 - frac)))
+        bits   = keep_d * 32
+        name   = f"cart_clip_{int(frac*100)}pct_f32"
+        schemes.append((name,
+                        (lambda k_: lambda c, a: cart_clip(c, a, k_, 32))(keep_d),
                         bits))
 
     # Greedy tier budgets
