@@ -457,11 +457,17 @@ def update_topk(top_scores: np.ndarray, top_gidx: np.ndarray,
         del merged_s, merged_g, sel
 
 
+DEFAULT_NDCG_KS = (5, 10, 15, 20)
+
+
 def _eval_metrics(top_scores: np.ndarray, top_gidx: np.ndarray,
                   q_ids: list[str], doc_id_arr: np.ndarray,
-                  qrels: dict[str, dict[str, int]]) -> tuple[float, float, int]:
-    ndcg_sc: list[float] = []
-    rec_sc:  list[float] = []
+                  qrels: dict[str, dict[str, int]],
+                  ndcg_ks: tuple[int, ...] = DEFAULT_NDCG_KS,
+                  recall_k: int = 100) -> dict:
+    """Return a dict with NDCG@k for each k in ndcg_ks, plus recall@recall_k."""
+    ndcg_by_k: dict[int, list[float]] = {k: [] for k in ndcg_ks}
+    rec_sc: list[float] = []
     for qi, qid in enumerate(q_ids):
         rel = qrels.get(qid)
         if not rel:
@@ -469,17 +475,21 @@ def _eval_metrics(top_scores: np.ndarray, top_gidx: np.ndarray,
         order      = np.argsort(-top_scores[qi])
         ranked_idx = top_gidx[qi][order]
         ranked_ids = doc_id_arr[ranked_idx]
-        rels  = [rel.get(did, 0) for did in ranked_ids[:10]]
-        ideal = sorted(rel.values(), reverse=True)
-        idcg  = sum(r / math.log2(i + 2) for i, r in enumerate(ideal[:10]))
-        ndcg  = sum(r / math.log2(i + 2) for i, r in enumerate(rels)) / idcg \
-                if idcg else 0.0
-        ndcg_sc.append(ndcg)
-        hits = sum(1 for did in ranked_ids[:100] if did in rel)
+        ideal      = sorted(rel.values(), reverse=True)
+        for k in ndcg_ks:
+            rels = [rel.get(did, 0) for did in ranked_ids[:k]]
+            idcg = sum(r / math.log2(i + 2) for i, r in enumerate(ideal[:k]))
+            ndcg = sum(r / math.log2(i + 2) for i, r in enumerate(rels)) / idcg \
+                   if idcg else 0.0
+            ndcg_by_k[k].append(ndcg)
+        hits = sum(1 for did in ranked_ids[:recall_k] if did in rel)
         rec_sc.append(hits / len(rel))
-    return (float(np.mean(ndcg_sc)) if ndcg_sc else 0.0,
-            float(np.mean(rec_sc))   if rec_sc  else 0.0,
-            len(ndcg_sc))
+
+    out = {f"ndcg{k}": (float(np.mean(ndcg_by_k[k])) if ndcg_by_k[k] else 0.0)
+           for k in ndcg_ks}
+    out[f"recall{recall_k}"] = float(np.mean(rec_sc)) if rec_sc else 0.0
+    out["n_queries"] = len(rec_sc)
+    return out
 
 
 def _build_super_batches(corpus_chunks: list[Path],
@@ -661,17 +671,18 @@ def score_all_schemes(
     results: list[dict] = []
     elapsed_total = time.perf_counter() - t0
     for si, (sname, _sfn, bits) in enumerate(schemes):
-        ndcg, rec, nq = _eval_metrics(top_scores[si], top_gidx[si],
-                                      q_ids, doc_id_arr, qrels)
-        results.append({
+        m = _eval_metrics(top_scores[si], top_gidx[si],
+                          q_ids, doc_id_arr, qrels)
+        row = {
             "scheme":       sname,
             "bits_per_vec": bits,
-            "ndcg10":       ndcg,
-            "recall100":    rec,
-            "n_queries":    nq,
+            **{k: v for k, v in m.items() if k.startswith("ndcg")},
+            "recall100":    m["recall100"],
+            "n_queries":    m["n_queries"],
             "n_corpus":     global_offset,
             "elapsed_s":    elapsed_total,
-        })
+        }
+        results.append(row)
     return results
 
 
@@ -680,16 +691,30 @@ def score_all_schemes(
 # ---------------------------------------------------------------------------
 
 def write_results(results: list[dict], base_bits: int, path: Path) -> None:
-    hdr = (f"{'scheme':<45} {'bits':>8} {'ratio':>7} "
-           f"{'NDCG@10':>9} {'R@100':>8} {'queries':>9} {'corpus':>12}")
+    # Pick up whatever NDCG@k columns the results happen to have (in order)
+    ndcg_keys = [k for k in results[0].keys()
+                 if k.startswith("ndcg") and k[4:].isdigit()]
+    ndcg_keys.sort(key=lambda s: int(s[4:]))
+
+    hdr_parts = [f"{'scheme':<45}", f"{'bits':>8}", f"{'ratio':>7}"]
+    for nk in ndcg_keys:
+        label = f"NDCG@{nk[4:]}"
+        hdr_parts.append(f"{label:>9}")
+    hdr_parts += [f"{'R@100':>8}", f"{'queries':>9}", f"{'corpus':>12}"]
+    hdr = " ".join(hdr_parts)
     sep = "-" * len(hdr)
     lines = [hdr, sep]
     for r in results:
         ratio = base_bits / r["bits_per_vec"] if r["bits_per_vec"] > 0 else float("inf")
-        lines.append(
-            f"{r['scheme']:<45} {r['bits_per_vec']:>8d} {ratio:>7.1f}x "
-            f"{r['ndcg10']:>9.4f} {r['recall100']:>8.4f} "
-            f"{r['n_queries']:>9,} {r['n_corpus']:>12,}")
+        parts = [f"{r['scheme']:<45}",
+                 f"{r['bits_per_vec']:>8d}",
+                 f"{ratio:>6.1f}x"]
+        for nk in ndcg_keys:
+            parts.append(f"{r[nk]:>9.4f}")
+        parts += [f"{r['recall100']:>8.4f}",
+                  f"{r['n_queries']:>9,}",
+                  f"{r['n_corpus']:>12,}"]
+        lines.append(" ".join(parts))
     text = "\n".join(lines)
     print("\n" + text)
     path.write_text(text + "\n", encoding="utf-8")
