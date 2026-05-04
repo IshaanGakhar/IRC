@@ -26,6 +26,7 @@ data/
 
 eval_results/
 eval_results_full/
+eval_results_*/
 *.png
 embeddings_minilm/
 embeddings_vllm/
