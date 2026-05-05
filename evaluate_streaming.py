@@ -360,84 +360,129 @@ def make_schemes(stats: dict, dim: int) -> list[tuple[str, object, int]]:
                 out[:, idx] = a[:, idx]
         return from_angles(out)
 
-    # Build schemes
-    sens = stats["sens"]
-    schemes = []
+    def ang_clip_zero(c, a, keep_n, keep_bits, idx=None):
+        """Variant of ang_clip that fills dropped angles with 0 instead
+        of the corpus mean."""
+        out = np.zeros_like(a)
+        if keep_n > 0:
+            _idx = idx[:keep_n] if idx is not None else np.arange(keep_n)
+            out[:, _idx] = _uquant(a[:, _idx], keep_bits, hi[_idx])
+        return from_angles(out)
 
-    # Baselines
-    schemes.append(("float32", lambda c, a: c, 32 * dim))
+    # Build schemes with logical-signature deduplication.
+    # Two scheme names that share a signature (i.e. produce identical
+    # reconstructed vectors for *every* input) are registered only once;
+    # the second name is recorded as an alias to spare wasted scoring.
+    sens                                     = stats["sens"]
+    schemes : list[tuple]                    = []
+    canonical: dict[tuple, str]              = {}      # sig -> canonical name
+    aliases : dict[str, str]                 = {}      # alias -> canonical
+
+    def _register(name, fn, bits, sig):
+        if sig in canonical:
+            aliases[name] = canonical[sig]
+            return
+        canonical[sig] = name
+        schemes.append((name, fn, bits))
+
+    # Float32 baseline
+    _register("float32", lambda c, a: c, 32 * dim, ("float32",))
+
+    # Cartesian uniform (per-coord scalar quant)
     for b in (8, 4, 2):
-        schemes.append((f"cart_int{b}",
-                        (lambda b_: lambda c, a: cart_quant(c, a, b_))(b),
-                        b * dim))
+        _register(f"cart_int{b}",
+                  (lambda b_: lambda c, a: cart_quant(c, a, b_))(b),
+                  b * dim,
+                  ("cart_quant", b))
 
-    # Angle uniform
+    # Angle uniform (no clipping; equivalent to "keep all" at b bits)
     for b in (8, 4, 2):
-        schemes.append((f"angle_int{b}_uniform",
-                        (lambda b_: lambda c, a: ang_uniform(c, a, b_))(b),
-                        b * n_angles))
+        _register(f"angle_int{b}_uniform",
+                  (lambda b_: lambda c, a: ang_uniform(c, a, b_))(b),
+                  b * n_angles,
+                  ("ang_uniform", b))
 
-    # Clipping sweep (Jacobian-ranked) at fixed int8
+    # Jacobian-ranked clipping at fixed int8.  When keep_n == n_angles
+    # this collapses to angle_int8_uniform irrespective of ranking, so
+    # the signature degenerates accordingly.
     for frac in (0.0, 0.2, 0.4, 0.5, 0.6, 0.8):
         keep_n = int(round(n_angles * (1.0 - frac)))
         bits   = keep_n * 8
-        name   = f"jac_clip_{int(frac*100)}pct"
-        schemes.append((name,
-                        (lambda k_, jk_: lambda c, a: ang_clip(c, a, k_, 8, jk_)
-                         )(keep_n, jac_rank),
-                        bits))
+        sig    = (("ang_uniform", 8) if keep_n >= n_angles
+                  else ("ang_clip", keep_n, 8, "jac"))
+        _register(f"jac_clip_{int(frac*100)}pct",
+                  (lambda k_, jk_: lambda c, a: ang_clip(c, a, k_, 8, jk_)
+                   )(keep_n, jac_rank),
+                  bits, sig)
 
-    # Positional clipping (same fracs, for comparison)
+    # Positional clipping (same fracs); identical to jac_clip only when
+    # jac_rank == identity, so we keep both families and let the data
+    # decide -- they do *not* share signatures.
     for frac in (0.0, 0.2, 0.4, 0.5, 0.6, 0.8):
         keep_n = int(round(n_angles * (1.0 - frac)))
         bits   = keep_n * 8
-        name   = f"pos_clip_{int(frac*100)}pct"
-        schemes.append((name,
-                        (lambda k_: lambda c, a: ang_clip(c, a, k_, 8))(keep_n),
-                        bits))
+        sig    = (("ang_uniform", 8) if keep_n >= n_angles
+                  else ("ang_clip", keep_n, 8, "pos"))
+        _register(f"pos_clip_{int(frac*100)}pct",
+                  (lambda k_: lambda c, a: ang_clip(c, a, k_, 8))(keep_n),
+                  bits, sig)
 
-    # Vanilla Cartesian truncation (Matryoshka-style):
-    #   keep first (1-frac)*D coords, int8-quantised, zero the rest, renorm.
-    #   Bit budget matches pos_clip_{frac} exactly: keep_d * 8 bits.
+    # Positional clipping with zero-fill (rest = 0 instead of corpus mean).
+    for frac in (0.0, 0.2, 0.4, 0.5, 0.6, 0.8):
+        keep_n = int(round(n_angles * (1.0 - frac)))
+        bits   = keep_n * 8
+        sig    = (("ang_uniform", 8) if keep_n >= n_angles
+                  else ("ang_clip_zero", keep_n, 8, "pos"))
+        _register(f"pos_clip_{int(frac*100)}pct_zero",
+                  (lambda k_: lambda c, a: ang_clip_zero(c, a, k_, 8))(keep_n),
+                  bits, sig)
+
+    # Vanilla Cartesian Matryoshka truncation at int8.  When keep_d == dim
+    # this collapses to cart_int8.
     for frac in (0.0, 0.2, 0.4, 0.5, 0.6, 0.8):
         keep_d = int(round(dim * (1.0 - frac)))
         bits   = keep_d * 8
-        name   = f"cart_clip_{int(frac*100)}pct"
-        schemes.append((name,
-                        (lambda k_: lambda c, a: cart_clip(c, a, k_, 8))(keep_d),
-                        bits))
+        sig    = (("cart_quant", 8) if keep_d >= dim
+                  else ("cart_clip", keep_d, 8))
+        _register(f"cart_clip_{int(frac*100)}pct",
+                  (lambda k_: lambda c, a: cart_clip(c, a, k_, 8))(keep_d),
+                  bits, sig)
 
     # Pure float32 Matryoshka slice (no quantisation, just truncate+renorm).
-    #   Budget = keep_d * 32 bits.  Useful to separate "truncation hurt"
-    #   from "quantisation hurt".
     for frac in (0.2, 0.4, 0.5, 0.6, 0.8):
         keep_d = int(round(dim * (1.0 - frac)))
         bits   = keep_d * 32
-        name   = f"cart_clip_{int(frac*100)}pct_f32"
-        schemes.append((name,
-                        (lambda k_: lambda c, a: cart_clip(c, a, k_, 32))(keep_d),
-                        bits))
+        _register(f"cart_clip_{int(frac*100)}pct_f32",
+                  (lambda k_: lambda c, a: cart_clip(c, a, k_, 32))(keep_d),
+                  bits, ("cart_clip_f32", keep_d))
 
-    # Greedy tier budgets
+    # Greedy tier budgets.
     for budget in (1536, 3072, 6144, 9216, 12288):
-        tiers    = greedy_tiers(sens, budget)
-        actual   = int(sum(TIER_BITS[t] for t in tiers))
-        name     = f"greedy_{budget}b"
-        schemes.append((name,
-                        (lambda t_: lambda c, a: apply_greedy(c, a, t_))(tiers),
-                        actual))
+        tiers  = greedy_tiers(sens, budget)
+        actual = int(sum(TIER_BITS[t] for t in tiers))
+        _register(f"greedy_{budget}b",
+                  (lambda t_: lambda c, a: apply_greedy(c, a, t_))(tiers),
+                  actual, ("greedy", budget))
 
-    # Jacobian truncation sweep (int8/int4/int2)
+    # Jacobian truncation sweep.  keep_n == n_angles is angle uniform;
+    # otherwise shares signature with jac_clip_{1-frac} at the same bits.
     for keep_bits in (8, 4, 2):
         for frac in (0.3, 0.5, 0.7, 1.0):
             keep_n = int(round(n_angles * frac))
             bits   = keep_n * keep_bits
-            name   = f"jac_trunc_int{keep_bits}_keep{int(frac*100)}pct"
-            schemes.append((name,
-                            (lambda k_, kb_, jk_:
-                             lambda c, a: ang_clip(c, a, k_, kb_, jk_)
-                             )(keep_n, keep_bits, jac_rank),
-                            bits))
+            sig    = (("ang_uniform", keep_bits) if keep_n >= n_angles
+                      else ("ang_clip", keep_n, keep_bits, "jac"))
+            _register(f"jac_trunc_int{keep_bits}_keep{int(frac*100)}pct",
+                      (lambda k_, kb_, jk_:
+                       lambda c, a: ang_clip(c, a, k_, kb_, jk_)
+                       )(keep_n, keep_bits, jac_rank),
+                      bits, sig)
+
+    if aliases:
+        print(f"  [schemes] {len(schemes)} unique schemes "
+              f"(+{len(aliases)} aliases skipped):")
+        for alias, canon in sorted(aliases.items()):
+            print(f"    {alias:38s} -> {canon}")
 
     return schemes
 
