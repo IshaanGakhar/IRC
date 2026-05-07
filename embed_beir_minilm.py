@@ -186,7 +186,9 @@ def flush_chunk(out_dir: Path, chunk_idx: int, tag: str,
 # Embedding
 # ---------------------------------------------------------------------------
 
-def make_encoder(model_name: str, device: str | None, fp16: bool,
+def make_encoder(model_name: str, device: str | None,
+                 hf_token: str | None,
+                 trust_remote_code: bool,
                  logger: logging.Logger):
     # Imported lazily so a missing torch install fails with a clear message
     # only when this script is actually run.
@@ -196,13 +198,23 @@ def make_encoder(model_name: str, device: str | None, fp16: bool,
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    if hf_token:
+        # huggingface_hub picks up the token globally for all model downloads
+        # in this process. Setting the env var also covers any internal
+        # subprocess that doesn't take an explicit token kwarg.
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+        logger.info("using HF_TOKEN from --hf-token / env (auth enabled)")
+    else:
+        logger.info("no HF token set — public models only")
+
     logger.info(f"loading model: {model_name}  (device={device})")
-    model = SentenceTransformer(model_name, device=device)
-    if fp16 and device.startswith("cuda"):
-        model = model.half()
-        logger.info("using fp16 on GPU")
-    elif fp16 and not device.startswith("cuda"):
-        logger.warning("fp16 requested but no CUDA device; staying in fp32")
+    kwargs: dict = {"device": device}
+    if hf_token:
+        kwargs["token"] = hf_token
+    if trust_remote_code:
+        kwargs["trust_remote_code"] = True
+    model = SentenceTransformer(model_name, **kwargs)
     return model, device
 
 
@@ -332,8 +344,13 @@ def main():
                     help="Suffix tagged into chunk filenames; defaults to minilm-l6.")
     ap.add_argument("--device", default=None,
                     help='"cuda", "cpu", or omit to auto-detect.')
-    ap.add_argument("--fp16", action="store_true",
-                    help="Use half precision on GPU (no effect on CPU).")
+    ap.add_argument("--hf-token",
+                    default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
+                    help="HuggingFace access token for gated/private models. "
+                         "Defaults to $HF_TOKEN or $HUGGING_FACE_HUB_TOKEN.")
+    ap.add_argument("--trust-remote-code", action="store_true",
+                    help="Pass trust_remote_code=True to SentenceTransformer "
+                         "(needed for nomic-embed and some other models).")
     ap.add_argument("--batch-size", type=int, default=None,
                     help=f"Default {DEFAULT_BATCH_GPU} on GPU, {DEFAULT_BATCH_CPU} on CPU.")
     ap.add_argument("--chunk-batches", type=int, default=CHUNK_BATCHES)
@@ -356,14 +373,17 @@ def main():
         logger.error(f"no BEIR-style datasets found under {data_dir}")
         sys.exit(1)
 
-    model, device = make_encoder(args.model, args.device, args.fp16, logger)
+    model, device = make_encoder(
+        args.model, args.device,
+        args.hf_token, args.trust_remote_code, logger,
+    )
     if args.batch_size is None:
         args.batch_size = DEFAULT_BATCH_GPU if device.startswith("cuda") else DEFAULT_BATCH_CPU
 
     logger.info(f"data_dir   = {data_dir}")
     logger.info(f"output_dir = {out_dir}")
     logger.info(f"model      = {args.model}  (tag={args.tag})")
-    logger.info(f"device     = {device}  fp16={args.fp16}")
+    logger.info(f"device     = {device}")
     logger.info(f"batch_size = {args.batch_size}  chunk_batches = {args.chunk_batches}")
     logger.info(f"datasets   = {[d.name for d in datasets]}")
 
